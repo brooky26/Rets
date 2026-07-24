@@ -1,0 +1,83 @@
+environment: live
+
+market_data:
+  connection:
+    rest_base_url: "https://api.derivws.com"
+    ws_public_url: "wss://api.derivws.com/trading/v1/options/ws/public"
+    ws_account_type: "demo"       # demo | real — only used when api_token is set
+    app_id: "1089"                 # replace with your real Deriv app_id
+    api_token: null                # set for authenticated access; null = public market data only
+    account_id: null               # e.g. "DOT90004580" — required if api_token is set
+    symbols:
+      - "stpRNG"
+      - "stpRNG2"
+      - "stpRNG3"
+      - "stpRNG4"
+      - "stpRNG5"
+    ping_interval_seconds: 20.0
+    reconnect_initial_backoff_seconds: 1.0
+    reconnect_max_backoff_seconds: 60.0
+    reconnect_backoff_multiplier: 2.0
+    max_reconnect_attempts: null
+    request_timeout_seconds: 15.0
+
+  historical:
+    lookback_days: 30
+    candle_granularity_seconds: 60
+    request_count_max: 5000
+
+  integrity:
+    max_allowed_gap_seconds: 30.0
+    max_price_jump_sigma: 12.0
+    min_ticks_for_sigma_estimate: 200
+    duplicate_timestamp_policy: "drop_duplicate"
+
+  storage:
+    backend: "sqlite"
+    sqlite_path: "./data_store/ticks.db"
+    write_batch_size: 500
+    flush_interval_seconds: 2.0
+
+# ---------------------------------------------------------------------- #
+# Trading pipeline. See main.py's module docstring for the full startup
+# sequence and what each toggle below actually changes.
+# ---------------------------------------------------------------------- #
+paper_trading:
+  enabled: true                    # false = data-collection + regime-logging only, no decisions at all
+  stake: 10.0
+  assumed_payout_ratio: 1.9
+  duration_ticks: 5                # only used as the static fallback when use_duration_selection: false
+  starting_equity: 1000.0
+  min_bootstrap_candles: 200
+  bagged_gbm_target_samples: 500
+  use_ensemble_fusion: true          # true = Bayesian Logistic + Bagged GBM + Monte Carlo GBM, fused
+  use_duration_selection: true       # true = per-candle MC/Hurst-informed duration choice instead of the fixed duration_ticks above
+
+regime_detection:
+  enable_hmm_promotion: true         # true = compare HMM vs rule-based once at startup, swap in only if it significantly outperforms
+  hmm_promotion_train_fraction: 0.6
+
+duration_selection:
+  candidate_durations_ticks: [3, 5, 8, 12, 20]
+  mc_max_standard_error: 0.05
+  mc_min_paths: 200
+  hurst_reference_duration_ticks: 5
+
+continuous_learning:
+  enabled: false                    # true = daily retrain/promote/re-optimize cycle for the first configured symbol (see continuous_learning/orchestrator.py)
+
+# ---------------------------------------------------------------------- #
+# LIVE TRADING — real Deriv orders, real money. Requires BOTH of these to
+# say "live" (ExecutionEngine raises at construction if they disagree —
+# an independent second safety rail so a single flag flip cannot enable
+# live trading by accident). Neither is "live" by default. Flipping both
+# is a deliberate action you take when you are actually ready — this file
+# does not do it for you, and cannot: it also requires a real
+# DERIV_API_TOKEN supplied via environment variables (never commit real
+# credentials here), which this repo does not have. DERIV_ACCOUNT_ID is
+# optional — auto-resolved from the token at startup if left unset (see
+# data/deriv_client.py's ensure_account_id / resolve_account_id).
+# ---------------------------------------------------------------------- #
+# environment: live               # (top of this file — currently "development")
+execution:
+  mode: "live"                    # "paper" | "live" — see the block comment above before ever changing this
