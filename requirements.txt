@@ -1,0 +1,18 @@
+pydantic>=2.6
+pyyaml>=6.0
+websockets>=12.0
+aiohttp>=3.9
+numpy>=1.26
+scipy>=1.11
+scikit-learn>=1.4
+optuna>=4.0
+apscheduler>=3.10
+pytest>=8.0
+pytest-asyncio>=0.23
+
+# Optional — only required to enable the LSTM/Transformer sequence models
+# (sequence_models/). Every other component (Bayesian Logistic, Bagged GBM,
+# regime detection, risk, execution, continuous learning orchestration,
+# etc.) has no dependency on torch and works fully without it — see
+# sequence_models/_torch_optional.py.
+torch>=2.2
