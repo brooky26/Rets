@@ -285,7 +285,7 @@ class DerivWebSocketClient:
             msg_type = message.get("msg_type")
             if msg_type == "tick":
                 await self._handle_tick_message(message)
-            elif msg_type in ("history", "candles", "proposal", "buy", "proposal_open_contract"):
+            elif msg_type in ("history", "candles", "proposal", "buy", "proposal_open_contract", "forget"):
                 self._resolve_pending(message)
 
     async def _handle_tick_message(self, message: dict) -> None:
@@ -453,6 +453,20 @@ class DerivWebSocketClient:
         Pagination (`fetch_paginated_history`) calls this repeatedly with
         progressively older integer `end_epoch` values to walk back further
         than one request's `request_count_max` cap allows.
+
+        `subscribe` is sent as `1`, not `0`: as of the current
+        `trading/v1/options` API, `ticks_history` rejects `subscribe: 0`
+        outright (`InputValidationFailed`, `details: {"subscribe": "Not in
+        enum list: 1."}` — confirmed against a real deployment's logs, not
+        just documentation, which still describes the older/legacy
+        behavior where 0 was accepted). Since this method is meant to be a
+        single request/response, not an ongoing stream, the resulting
+        subscription is immediately cancelled via `forget` right after the
+        first response arrives — see `_forget_subscription_if_any` below.
+        Without that cleanup, every one-shot historical fetch would leave a
+        live server-side subscription running, and pagination (which calls
+        this repeatedly per symbol) would quickly hit Deriv's per-connection
+        subscription limit.
         """
         if self._ws is None:
             raise DerivClientError("Cannot fetch history: not connected.")
@@ -467,7 +481,7 @@ class DerivWebSocketClient:
             "start": 1,
             "style": "candles",
             "granularity": granularity,
-            "subscribe": 0,
+            "subscribe": 1,
             "req_id": req_id,
         }
         future: asyncio.Future = asyncio.get_event_loop().create_future()
@@ -479,6 +493,8 @@ class DerivWebSocketClient:
         )
         if response.get("error"):
             raise DerivClientError(f"History request failed: {response['error']}")
+
+        await self._forget_subscription_if_any(response)
 
         candles_raw = response.get("candles", [])
         return [
@@ -493,6 +509,34 @@ class DerivWebSocketClient:
             )
             for c in candles_raw
         ]
+
+    async def _forget_subscription_if_any(self, response: dict) -> None:
+        """
+        Cancels the server-side subscription a `subscribe: 1` request
+        creates, so a nominally "one-shot" call (`fetch_historical_candles`)
+        doesn't leave a live stream running. Best-effort: logs and returns
+        on any failure (missing subscription id, timeout, error response)
+        rather than raising — the historical data itself was already
+        received successfully by the time this is called, so a failed
+        cleanup shouldn't fail the whole fetch, only leak one subscription
+        slot (logged, so it's visible rather than silent).
+        """
+        subscription_id = response.get("subscription", {}).get("id")
+        if not subscription_id:
+            return
+        req_id = self._next_req_id()
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending[req_id] = future
+        try:
+            await self._ws.send(json.dumps({"forget": subscription_id, "req_id": req_id}))
+            await asyncio.wait_for(future, timeout=self._cfg.request_timeout_seconds)
+        except Exception as exc:  # noqa: BLE001 — cleanup best-effort, never fails the caller
+            self._pending.pop(req_id, None)
+            logger.warning(
+                "Failed to forget subscription %s after one-shot history fetch: %s "
+                "(non-fatal — data was already received).",
+                subscription_id, exc,
+            )
 
     def _resolve_pending(self, message: dict) -> None:
         req_id = message.get("req_id")
