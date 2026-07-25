@@ -44,6 +44,8 @@ refuse to do silently.
 
 from __future__ import annotations
 
+import asyncio
+
 from configs.execution_schema import ExecutionConfig
 from expected_value.types import ContractSpec, ContractType, EVEstimate
 from execution.types import BrokerClient, ExecutionDecision, ExecutionMode
@@ -154,8 +156,20 @@ class ExecutionEngine:
                 duration_ticks=contract.duration_ticks,
                 currency=self._config.currency,
             )
+        except asyncio.TimeoutError:
+            # asyncio.TimeoutError.__str__() is "" — without this branch it
+            # gets logged as an unhelpful blank "Proposal request failed: ".
+            return self._error(
+                opportunity, risk.recommended_stake,
+                "Proposal request timed out waiting for Deriv's response "
+                "(no error from the API — the request just never came back "
+                "within request_timeout_seconds).",
+            )
         except Exception as exc:  # noqa: BLE001 — broker failures are reported, not propagated raw
-            return self._error(opportunity, risk.recommended_stake, f"Proposal request failed: {exc}")
+            return self._error(
+                opportunity, risk.recommended_stake,
+                f"Proposal request failed: {exc!r} (type={type(exc).__name__})",
+            )
 
         ask_price = float(proposal["ask_price"])
         live_payout = float(proposal["payout"])
@@ -190,8 +204,20 @@ class ExecutionEngine:
 
         try:
             buy_result = await self._broker_client.buy(proposal["id"], ask_price)
+        except asyncio.TimeoutError:
+            return self._error(
+                opportunity, risk.recommended_stake,
+                "Buy request timed out waiting for Deriv's response "
+                "(no error from the API — the request just never came back "
+                "within request_timeout_seconds). IMPORTANT: the contract may "
+                "still have been bought on Deriv's side even though we never "
+                "got confirmation — check the account before retrying.",
+            )
         except Exception as exc:  # noqa: BLE001
-            return self._error(opportunity, risk.recommended_stake, f"Buy request failed: {exc}")
+            return self._error(
+                opportunity, risk.recommended_stake,
+                f"Buy request failed: {exc!r} (type={type(exc).__name__})",
+            )
 
         return ExecutionDecision(
             symbol=opportunity.symbol,
