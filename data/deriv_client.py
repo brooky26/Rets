@@ -542,7 +542,18 @@ class DerivWebSocketClient:
             )
 
     def _resolve_pending(self, message: dict) -> None:
+        # Success responses on this API carry req_id at the top level, but
+        # error responses have been observed (live logs — an "AlreadySubscribed"
+        # proposal error) to omit it there and only echo it inside echo_req.
+        # Without this fallback, an error response silently fails to match
+        # anything in self._pending (req_id=None is never a valid key, so
+        # this returns with no warning at all) and the caller just waits out
+        # the full request_timeout_seconds instead of getting the real error
+        # immediately — which is exactly what happened: every proposal
+        # attempt timed out even though Deriv had already rejected it.
         req_id = message.get("req_id")
+        if req_id is None:
+            req_id = message.get("echo_req", {}).get("req_id")
         if req_id not in self._pending:
             return
         future = self._pending.pop(req_id)
