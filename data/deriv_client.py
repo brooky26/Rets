@@ -488,9 +488,12 @@ class DerivWebSocketClient:
         self._pending[req_id] = future
         await self._ws.send(json.dumps(request))
 
-        response = await asyncio.wait_for(
-            future, timeout=self._cfg.request_timeout_seconds
-        )
+        try:
+            response = await asyncio.wait_for(
+                future, timeout=self._cfg.request_timeout_seconds
+            )
+        finally:
+            self._pending.pop(req_id, None)
         if response.get("error"):
             raise DerivClientError(f"History request failed: {response['error']}")
 
@@ -540,8 +543,23 @@ class DerivWebSocketClient:
 
     def _resolve_pending(self, message: dict) -> None:
         req_id = message.get("req_id")
-        if req_id in self._pending:
-            self._pending.pop(req_id).set_result(message)
+        if req_id not in self._pending:
+            return
+        future = self._pending.pop(req_id)
+        if future.done():
+            # Already resolved (or timed out and cancelled) by the time this
+            # message arrived — a genuine crash we hit in production
+            # (asyncio.exceptions.InvalidStateError from calling set_result
+            # on a done future). One stale/duplicate/late message must never
+            # be able to take down the whole worker, so this is logged and
+            # dropped rather than raised.
+            logger.warning(
+                "Received a message for req_id=%s after its future was already resolved — "
+                "ignoring (likely a late duplicate or a client-side timeout that already fired).",
+                req_id,
+            )
+            return
+        future.set_result(message)
 
     # ------------------------------------------------------------------ #
     # Execution: live proposal + buy (Level 6)
@@ -577,16 +595,19 @@ class DerivWebSocketClient:
             "currency": currency,
             "duration": duration_ticks,
             "duration_unit": "t",
-            "symbol": symbol,
+            "underlying_symbol": symbol,  # renamed from "symbol" in the current trading/v1/options API
             "req_id": req_id,
         }
         future: asyncio.Future = asyncio.get_event_loop().create_future()
         self._pending[req_id] = future
         await self._ws.send(json.dumps(request))
 
-        response = await asyncio.wait_for(
-            future, timeout=self._cfg.request_timeout_seconds
-        )
+        try:
+            response = await asyncio.wait_for(
+                future, timeout=self._cfg.request_timeout_seconds
+            )
+        finally:
+            self._pending.pop(req_id, None)
         if response.get("error"):
             raise DerivClientError(f"Proposal request failed: {response['error']}")
         return response["proposal"]
@@ -612,9 +633,12 @@ class DerivWebSocketClient:
         self._pending[req_id] = future
         await self._ws.send(json.dumps(request))
 
-        response = await asyncio.wait_for(
-            future, timeout=self._cfg.request_timeout_seconds
-        )
+        try:
+            response = await asyncio.wait_for(
+                future, timeout=self._cfg.request_timeout_seconds
+            )
+        finally:
+            self._pending.pop(req_id, None)
         if response.get("error"):
             raise DerivClientError(f"Buy request failed: {response['error']}")
         return response["buy"]
@@ -651,9 +675,12 @@ class DerivWebSocketClient:
         self._pending[req_id] = future
         await self._ws.send(json.dumps(request))
 
-        response = await asyncio.wait_for(
-            future, timeout=self._cfg.request_timeout_seconds
-        )
+        try:
+            response = await asyncio.wait_for(
+                future, timeout=self._cfg.request_timeout_seconds
+            )
+        finally:
+            self._pending.pop(req_id, None)
         if response.get("error"):
             raise DerivClientError(f"Contract status request failed: {response['error']}")
         return response["proposal_open_contract"]
