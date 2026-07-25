@@ -65,7 +65,12 @@ async def test_fetch_proposal_sends_correct_request_shape():
     assert sent["contract_type"] == "CALL"
     assert sent["duration"] == 5
     assert sent["duration_unit"] == "t"
-    assert sent["symbol"] == "STPRNG100"
+    # "underlying_symbol", not "symbol" — a live account explicitly rejects "symbol"
+    # ({"code": "InputValidationFailed", "message": "Properties not allowed: symbol."}).
+    # This test previously asserted "symbol" incorrectly; don't revert this without
+    # confirming against an actual proposal request/response pair.
+    assert sent["underlying_symbol"] == "STPRNG100"
+    assert sent["subscribe"] == 1
     assert result == {"id": "prop1", "ask_price": 10.0, "payout": 19.0}
 
 
