@@ -58,7 +58,7 @@ regime_detection:
   hmm_promotion_train_fraction: 0.6
 
 duration_selection:
-  candidate_durations_ticks: [3, 5, 8, 12, 20]
+  candidate_durations_ticks: [3, 5, 7, 8, 10]  # kept within Deriv's confirmed live limit of 1-10 ticks (see 'TicksNumberLimits' error, code_args: [1, 10]) — was [3, 5, 8, 12, 20], and 12/20 were rejected
   mc_max_standard_error: 0.05
   mc_min_paths: 200
   hurst_reference_duration_ticks: 5
