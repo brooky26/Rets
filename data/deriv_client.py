@@ -48,6 +48,7 @@ has been updated to match; don't trust that test's prior assertion of
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 from datetime import datetime, timezone
@@ -258,6 +259,18 @@ class DerivWebSocketClient:
         return await self._otp.fetch_authenticated_ws_url()
 
     async def _connect_and_stream(self) -> None:
+        # Any future still sitting in self._pending belongs to the previous
+        # (now-dead) connection — a late response can never arrive on a socket
+        # that no longer exists. shield() in fetch_proposal deliberately keeps
+        # timed-out futures alive so a late response on the SAME connection can
+        # still be caught; across a reconnect that guarantee is moot, so clear
+        # them here rather than leaking one future per timed-out request for
+        # the life of the process.
+        for pending_future in self._pending.values():
+            if not pending_future.done():
+                pending_future.cancel()
+        self._pending.clear()
+
         url = await self._resolve_connect_url()
         async with websockets.connect(
             url, ping_interval=self._cfg.ping_interval_seconds
@@ -533,17 +546,24 @@ class DerivWebSocketClient:
     async def _forget_subscription_if_any(self, response: dict) -> None:
         """
         Cancels the server-side subscription a `subscribe: 1` request
-        creates, so a nominally "one-shot" call (`fetch_historical_candles`)
-        doesn't leave a live stream running. Best-effort: logs and returns
-        on any failure (missing subscription id, timeout, error response)
-        rather than raising — the historical data itself was already
-        received successfully by the time this is called, so a failed
-        cleanup shouldn't fail the whole fetch, only leak one subscription
-        slot (logged, so it's visible rather than silent).
+        creates, so a nominally "one-shot" call (`fetch_historical_candles`,
+        `fetch_proposal`) doesn't leave a live stream running.
         """
         subscription_id = response.get("subscription", {}).get("id")
         if not subscription_id:
             return
+        await self._forget_by_id(subscription_id)
+
+    async def _forget_by_id(self, subscription_id: str) -> None:
+        """
+        Best-effort: logs and returns on any failure (timeout, error
+        response) rather than raising. Shared by the normal one-shot
+        cleanup path above and the late-arriving-response cleanup path in
+        fetch_proposal below — in both cases, whatever this subscription
+        was for has already been dealt with by the caller, so a failed
+        forget shouldn't raise, it should just leak one subscription slot
+        (logged, so it's visible rather than silent).
+        """
         req_id = self._next_req_id()
         future: asyncio.Future = asyncio.get_event_loop().create_future()
         self._pending[req_id] = future
@@ -553,8 +573,8 @@ class DerivWebSocketClient:
         except Exception as exc:  # noqa: BLE001 — cleanup best-effort, never fails the caller
             self._pending.pop(req_id, None)
             logger.warning(
-                "Failed to forget subscription %s after one-shot history fetch: %s "
-                "(non-fatal — data was already received).",
+                "Failed to forget subscription %s: %s (non-fatal, but this "
+                "subscription slot is now leaked until reconnect).",
                 subscription_id, exc,
             )
 
@@ -631,11 +651,37 @@ class DerivWebSocketClient:
         await self._ws.send(json.dumps(request))
 
         try:
+            # asyncio.shield() matters here, not just style: plain `wait_for(future, ...)`
+            # CANCELS `future` itself the moment the timeout fires. That's fine for a
+            # request that's genuinely dead — but confirmed in production
+            # (logs_1784974444569.csv), Deriv frequently responds to `proposal`
+            # requests right around/after request_timeout_seconds; the request is
+            # very often not dead, just slow. If the timeout cancels `future`, the
+            # late response has nothing left to resolve — `_resolve_pending` finds
+            # `future.done()` already True and silently drops the message — and the
+            # subscription that response just created is never forgotten. It then
+            # sits there forever, and every subsequent fetch_proposal for this same
+            # symbol fails immediately with {"code": "AlreadySubscribed", "message":
+            # "You are already subscribed to proposal."} for the rest of this
+            # connection's life. shield() lets the outer wait time out without
+            # touching the inner `future`, so it's still alive in `self._pending`
+            # to catch a late response below.
             response = await asyncio.wait_for(
-                future, timeout=self._cfg.request_timeout_seconds
+                asyncio.shield(future), timeout=self._cfg.request_timeout_seconds
             )
-        finally:
-            self._pending.pop(req_id, None)
+        except asyncio.TimeoutError:
+            # Re-raise asyncio.TimeoutError itself (bare `raise`, not a different
+            # exception type) — execution/engine.py has a dedicated
+            # `except asyncio.TimeoutError:` branch that depends on catching this
+            # exact type to report a clean, specific reason (and, for buy(), a
+            # genuinely important safety note that the order may have gone through
+            # anyway). Raising a different type here (e.g. DerivClientError) would
+            # silently fall through to engine.py's generic `except Exception`
+            # branch instead and lose that specific handling — this happened in a
+            # previous version of this fix and needs to not happen again.
+            future.add_done_callback(functools.partial(self._on_late_proposal_response, symbol))
+            raise
+        self._pending.pop(req_id, None)
         if response.get("error"):
             raise DerivClientError(f"Proposal request failed: {response['error']}")
 
@@ -649,6 +695,33 @@ class DerivWebSocketClient:
         await self._forget_subscription_if_any(response)
 
         return response["proposal"]
+
+    def _on_late_proposal_response(self, symbol: str, future: asyncio.Future) -> None:
+        """
+        Done-callback attached only when a fetch_proposal call has already
+        timed out locally. If Deriv's response arrives after all, this
+        forgets whatever subscription it created — otherwise that
+        subscription is orphaned forever and every later fetch_proposal for
+        `symbol` fails immediately with AlreadySubscribed (see fetch_proposal
+        above for the full explanation). This runs as an asyncio done-callback,
+        so it must never raise or await directly.
+        """
+        if future.cancelled() or future.exception() is not None:
+            return
+        response = future.result()
+        if response.get("error"):
+            return  # Deriv rejected it — nothing was subscribed, nothing to forget.
+        subscription_id = response.get("subscription", {}).get("id")
+        if not subscription_id:
+            return
+        logger.warning(
+            "%s: a fetch_proposal call that already timed out locally just "
+            "succeeded server-side (subscription id=%s) — forgetting it now so "
+            "it doesn't permanently block future proposal requests for this "
+            "symbol with AlreadySubscribed.",
+            symbol, subscription_id,
+        )
+        asyncio.get_event_loop().create_task(self._forget_by_id(subscription_id))
 
     async def buy(self, proposal_id: str, price: float) -> dict:
         """
@@ -672,14 +745,58 @@ class DerivWebSocketClient:
         await self._ws.send(json.dumps(request))
 
         try:
+            # Same reasoning as fetch_proposal above, and higher-stakes here:
+            # execution/engine.py's own comment already acknowledges a buy
+            # timeout doesn't mean the buy failed — "the contract may still
+            # have been bought on Deriv's side even though we never got
+            # confirmation — check the account before retrying." Without
+            # shield(), a late confirmation is silently dropped and that
+            # check-the-account step is the ONLY way to ever find out.
+            # shield() keeps this future alive so a late response can still be
+            # captured and logged automatically instead of relying solely on
+            # someone remembering to go look.
             response = await asyncio.wait_for(
-                future, timeout=self._cfg.request_timeout_seconds
+                asyncio.shield(future), timeout=self._cfg.request_timeout_seconds
             )
-        finally:
-            self._pending.pop(req_id, None)
+        except asyncio.TimeoutError:
+            future.add_done_callback(functools.partial(self._on_late_buy_response, proposal_id))
+            raise
+        self._pending.pop(req_id, None)
         if response.get("error"):
             raise DerivClientError(f"Buy request failed: {response['error']}")
         return response["buy"]
+
+    def _on_late_buy_response(self, proposal_id: str, future: asyncio.Future) -> None:
+        """
+        Done-callback attached only when a buy() call has already timed out
+        locally. If Deriv's response arrives after all, this logs it —
+        contract_id and all — since the caller already gave up and reported
+        an error, so this is the only remaining way to surface that a real
+        contract may now be open. This runs as an asyncio done-callback, so
+        it must never raise.
+        """
+        if future.cancelled() or future.exception() is not None:
+            return
+        response = future.result()
+        if response.get("error"):
+            logger.warning(
+                "A buy request for proposal_id=%s that already timed out locally "
+                "was actually rejected server-side: %s — no contract was opened.",
+                proposal_id, response["error"],
+            )
+            return
+        buy_result = response.get("buy", {})
+        logger.warning(
+            "IMPORTANT: a buy request for proposal_id=%s that already timed out "
+            "locally actually SUCCEEDED server-side — contract_id=%s, "
+            "buy_price=%s, payout=%s. This contract is real and open but was "
+            "never returned to the caller, since it had already given up and "
+            "reported an error — reconcile this against the account.",
+            proposal_id,
+            buy_result.get("contract_id"),
+            buy_result.get("buy_price"),
+            buy_result.get("payout"),
+        )
 
     async def check_contract_status(self, contract_id: str) -> dict:
         """
