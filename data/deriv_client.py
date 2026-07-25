@@ -27,13 +27,21 @@ requests, tick/history responses) is still what Deriv's WS speaks, just
 over the new transport, with tick.symbol/epoch/quote now guaranteed
 present in every tick message (previously optional).
 
-Note on `proposal` requests specifically: the field is "symbol", same
-as always. It is NOT "underlying_symbol" — that name only appears in
-`active_symbols` *responses* (see find_step_index_symbols.py), and an
-earlier fix mistakenly carried it into the `proposal` *request* in
-fetch_proposal(), which caused Deriv to silently never respond to any
-proposal request (no error, just a hang until request_timeout_seconds).
-Don't reintroduce that rename without confirming against an actual
+Note on `proposal` requests specifically — CORRECTED, see below:
+An earlier version of this comment claimed the field should be
+"symbol", based on a unit test's assumption. That was wrong: a live
+account on this API rejects "symbol" outright —
+`{"code": "InputValidationFailed", "message": "Input validation
+failed: Properties not allowed: symbol."}` — confirmed against real
+deployment logs, same as the ticks_history precedent below. The field
+IS "underlying_symbol". Additionally, "subscribe" must be sent
+explicitly as `1` (mirroring ticks_history's confirmed behavior below)
+— omitting it produced zero response from Deriv, ever, for any
+proposal request, which is consistent with Deriv accepting the
+request as schema-valid but never generating a priced response
+without an explicit subscription. `tests/test_deriv_client_execution.py`
+has been updated to match; don't trust that test's prior assertion of
+"symbol" over live API evidence again — confirm against an actual
 `proposal` request/response pair, not an unrelated endpoint's schema.
 """
 
@@ -604,15 +612,18 @@ class DerivWebSocketClient:
             "currency": currency,
             "duration": duration_ticks,
             "duration_unit": "t",
-            "symbol": symbol,  # the `proposal` request field is "symbol", not "underlying_symbol" —
-            # "underlying_symbol" is a field Deriv returns *in `active_symbols` responses*
-            # (see find_step_index_symbols.py), not a field the `proposal` *request* accepts.
-            # A previous fix mistakenly carried that response-schema field name into this
-            # request payload, so every proposal request was missing the required "symbol"
-            # field and carrying an unrecognized one — Deriv silently never responds to it,
-            # which is why every fetch_proposal call timed out after request_timeout_seconds
-            # with no error (see tests/test_deriv_client_execution.py, which already pinned
-            # "symbol" as the correct field and was failing against this code).
+            "underlying_symbol": symbol,
+            # "subscribe": 1 is required, not optional — confirmed by live evidence:
+            # sending "symbol" instead of "underlying_symbol" got an immediate, explicit
+            # rejection ({"code": "InputValidationFailed", "message": "Properties not
+            # allowed: symbol."}), which proves the connection/auth/transport layer is
+            # fine and Deriv is actively validating this request. But even with the
+            # correct field name, omitting "subscribe" produced ZERO response — no
+            # error, no proposal, ever — across two full deployment logs. That matches
+            # ticks_history's confirmed behavior on this same API (see
+            # fetch_historical_candles below): the request is schema-valid but Deriv
+            # never generates a priced response without an explicit subscription.
+            "subscribe": 1,
             "req_id": req_id,
         }
         future: asyncio.Future = asyncio.get_event_loop().create_future()
@@ -627,6 +638,16 @@ class DerivWebSocketClient:
             self._pending.pop(req_id, None)
         if response.get("error"):
             raise DerivClientError(f"Proposal request failed: {response['error']}")
+
+        # subscribe:1 leaves a live server-side subscription running (continuous
+        # re-pricing pushes) — the caller here only wants a single quote, so cancel
+        # it immediately, same cleanup fetch_historical_candles does for its own
+        # one-shot subscribe:1 requests. Left running, every proposal fetch (one per
+        # symbol per cycle, indefinitely) would leak a subscription, which would
+        # eventually exhaust Deriv's per-connection subscription limit and could
+        # itself start producing the exact same silent-hang symptom again later.
+        await self._forget_subscription_if_any(response)
+
         return response["proposal"]
 
     async def buy(self, proposal_id: str, price: float) -> dict:
