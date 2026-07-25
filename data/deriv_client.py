@@ -606,9 +606,17 @@ class DerivWebSocketClient:
             response = await asyncio.wait_for(
                 future, timeout=self._cfg.request_timeout_seconds
             )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "fetch_proposal timed out after %.1fs with no response from Deriv "
+                "for req_id=%d — request was: %s",
+                self._cfg.request_timeout_seconds, req_id, request,
+            )
+            raise
         finally:
             self._pending.pop(req_id, None)
         if response.get("error"):
+            logger.warning("fetch_proposal error response from Deriv: %s", response["error"])
             raise DerivClientError(f"Proposal request failed: {response['error']}")
         return response["proposal"]
 
@@ -637,9 +645,18 @@ class DerivWebSocketClient:
             response = await asyncio.wait_for(
                 future, timeout=self._cfg.request_timeout_seconds
             )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "buy timed out after %.1fs with no response from Deriv for "
+                "req_id=%d — request was: %s — the order may still have gone "
+                "through on Deriv's side even without confirmation reaching us.",
+                self._cfg.request_timeout_seconds, req_id, request,
+            )
+            raise
         finally:
             self._pending.pop(req_id, None)
         if response.get("error"):
+            logger.warning("buy error response from Deriv: %s", response["error"])
             raise DerivClientError(f"Buy request failed: {response['error']}")
         return response["buy"]
 
