@@ -44,10 +44,10 @@ market_data:
 # ---------------------------------------------------------------------- #
 paper_trading:
   enabled: true                    # false = data-collection + regime-logging only, no decisions at all
-  stake: 10.0
+  stake: 1.0
   assumed_payout_ratio: 1.9
   duration_ticks: 5                # only used as the static fallback when use_duration_selection: false
-  starting_equity: 1000.0
+  starting_equity: 10.0
   min_bootstrap_candles: 200
   bagged_gbm_target_samples: 500
   use_ensemble_fusion: true          # true = Bayesian Logistic + Bagged GBM + Monte Carlo GBM, fused
@@ -60,7 +60,7 @@ regime_detection:
 duration_selection:
   candidate_durations_ticks: [3, 5, 7, 8, 10]  # kept within Deriv's confirmed live limit of 1-10 ticks (see 'TicksNumberLimits' error, code_args: [1, 10]) — was [3, 5, 8, 12, 20], and 12/20 were rejected
   mc_max_standard_error: 0.05
-  mc_min_paths: 200
+  mc_min_paths: 20000
   hurst_reference_duration_ticks: 5
 
 continuous_learning:
@@ -80,4 +80,4 @@ continuous_learning:
 # ---------------------------------------------------------------------- #
 # environment: live               # (top of this file — currently "development")
 execution:
-  mode: "live"                    # "paper" | "live" — see the block comment above before ever changing this
+  mode: "paper"                    # "paper" | "live" — see the block comment above before ever changing this
