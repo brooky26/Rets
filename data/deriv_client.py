@@ -582,6 +582,22 @@ class DerivWebSocketClient:
 
         Returns the raw `proposal` dict from Deriv's response (id,
         ask_price, payout, ...) — the caller decides what to do with it.
+
+        `subscribe` is sent as `1`, matching the same `trading/v1/options`
+        quirk documented on `fetch_historical_candles` above: this API
+        appears to require an explicit `subscribe` value on request types
+        that support streaming, rather than defaulting to a one-shot
+        response when the field is omitted entirely. Live logs showed
+        `fetch_proposal` (which never sent `subscribe` at all) hanging
+        until `request_timeout_seconds` with no response and no error —
+        distinct from `ticks_history`'s behavior of rejecting `subscribe:
+        0` outright with `InputValidationFailed`, but consistent with the
+        same underlying cause: an unrecognized/incomplete request shape
+        that the server never replies to instead of erroring. Since this
+        method is meant to be a single request/response, not an ongoing
+        stream, the resulting subscription is cancelled via `forget`
+        right after the first response arrives, exactly as
+        `fetch_historical_candles` does.
         """
         if self._ws is None:
             raise DerivClientError("Cannot fetch proposal: not connected.")
@@ -596,6 +612,7 @@ class DerivWebSocketClient:
             "duration": duration_ticks,
             "duration_unit": "t",
             "underlying_symbol": symbol,  # renamed from "symbol" in the current trading/v1/options API
+            "subscribe": 1,
             "req_id": req_id,
         }
         future: asyncio.Future = asyncio.get_event_loop().create_future()
@@ -618,6 +635,8 @@ class DerivWebSocketClient:
         if response.get("error"):
             logger.warning("fetch_proposal error response from Deriv: %s", response["error"])
             raise DerivClientError(f"Proposal request failed: {response['error']}")
+
+        await self._forget_subscription_if_any(response)
         return response["proposal"]
 
     async def buy(self, proposal_id: str, price: float) -> dict:
