@@ -80,4 +80,4 @@ continuous_learning:
 # ---------------------------------------------------------------------- #
 # environment: live               # (top of this file — currently "development")
 execution:
-  mode: "development"                    # "paper" | "live" — see the block comment above before ever changing this
+  mode: "paper"                    # "paper" | "live" — see the block comment above before ever changing this
