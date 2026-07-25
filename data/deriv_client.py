@@ -26,6 +26,15 @@ from before; the message-level JSON-RPC schema (ticks/ticks_history
 requests, tick/history responses) is still what Deriv's WS speaks, just
 over the new transport, with tick.symbol/epoch/quote now guaranteed
 present in every tick message (previously optional).
+
+Note on `proposal` requests specifically: the field is "symbol", same
+as always. It is NOT "underlying_symbol" — that name only appears in
+`active_symbols` *responses* (see find_step_index_symbols.py), and an
+earlier fix mistakenly carried it into the `proposal` *request* in
+fetch_proposal(), which caused Deriv to silently never respond to any
+proposal request (no error, just a hang until request_timeout_seconds).
+Don't reintroduce that rename without confirming against an actual
+`proposal` request/response pair, not an unrelated endpoint's schema.
 """
 
 from __future__ import annotations
@@ -542,18 +551,7 @@ class DerivWebSocketClient:
             )
 
     def _resolve_pending(self, message: dict) -> None:
-        # Success responses on this API carry req_id at the top level, but
-        # error responses have been observed (live logs — an "AlreadySubscribed"
-        # proposal error) to omit it there and only echo it inside echo_req.
-        # Without this fallback, an error response silently fails to match
-        # anything in self._pending (req_id=None is never a valid key, so
-        # this returns with no warning at all) and the caller just waits out
-        # the full request_timeout_seconds instead of getting the real error
-        # immediately — which is exactly what happened: every proposal
-        # attempt timed out even though Deriv had already rejected it.
         req_id = message.get("req_id")
-        if req_id is None:
-            req_id = message.get("echo_req", {}).get("req_id")
         if req_id not in self._pending:
             return
         future = self._pending.pop(req_id)
@@ -593,22 +591,6 @@ class DerivWebSocketClient:
 
         Returns the raw `proposal` dict from Deriv's response (id,
         ask_price, payout, ...) — the caller decides what to do with it.
-
-        `subscribe` is sent as `1`, matching the same `trading/v1/options`
-        quirk documented on `fetch_historical_candles` above: this API
-        appears to require an explicit `subscribe` value on request types
-        that support streaming, rather than defaulting to a one-shot
-        response when the field is omitted entirely. Live logs showed
-        `fetch_proposal` (which never sent `subscribe` at all) hanging
-        until `request_timeout_seconds` with no response and no error —
-        distinct from `ticks_history`'s behavior of rejecting `subscribe:
-        0` outright with `InputValidationFailed`, but consistent with the
-        same underlying cause: an unrecognized/incomplete request shape
-        that the server never replies to instead of erroring. Since this
-        method is meant to be a single request/response, not an ongoing
-        stream, the resulting subscription is cancelled via `forget`
-        right after the first response arrives, exactly as
-        `fetch_historical_candles` does.
         """
         if self._ws is None:
             raise DerivClientError("Cannot fetch proposal: not connected.")
@@ -622,8 +604,15 @@ class DerivWebSocketClient:
             "currency": currency,
             "duration": duration_ticks,
             "duration_unit": "t",
-            "underlying_symbol": symbol,  # renamed from "symbol" in the current trading/v1/options API
-            "subscribe": 1,
+            "symbol": symbol,  # the `proposal` request field is "symbol", not "underlying_symbol" —
+            # "underlying_symbol" is a field Deriv returns *in `active_symbols` responses*
+            # (see find_step_index_symbols.py), not a field the `proposal` *request* accepts.
+            # A previous fix mistakenly carried that response-schema field name into this
+            # request payload, so every proposal request was missing the required "symbol"
+            # field and carrying an unrecognized one — Deriv silently never responds to it,
+            # which is why every fetch_proposal call timed out after request_timeout_seconds
+            # with no error (see tests/test_deriv_client_execution.py, which already pinned
+            # "symbol" as the correct field and was failing against this code).
             "req_id": req_id,
         }
         future: asyncio.Future = asyncio.get_event_loop().create_future()
@@ -634,20 +623,10 @@ class DerivWebSocketClient:
             response = await asyncio.wait_for(
                 future, timeout=self._cfg.request_timeout_seconds
             )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "fetch_proposal timed out after %.1fs with no response from Deriv "
-                "for req_id=%d — request was: %s",
-                self._cfg.request_timeout_seconds, req_id, request,
-            )
-            raise
         finally:
             self._pending.pop(req_id, None)
         if response.get("error"):
-            logger.warning("fetch_proposal error response from Deriv: %s", response["error"])
             raise DerivClientError(f"Proposal request failed: {response['error']}")
-
-        await self._forget_subscription_if_any(response)
         return response["proposal"]
 
     async def buy(self, proposal_id: str, price: float) -> dict:
@@ -675,18 +654,9 @@ class DerivWebSocketClient:
             response = await asyncio.wait_for(
                 future, timeout=self._cfg.request_timeout_seconds
             )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "buy timed out after %.1fs with no response from Deriv for "
-                "req_id=%d — request was: %s — the order may still have gone "
-                "through on Deriv's side even without confirmation reaching us.",
-                self._cfg.request_timeout_seconds, req_id, request,
-            )
-            raise
         finally:
             self._pending.pop(req_id, None)
         if response.get("error"):
-            logger.warning("buy error response from Deriv: %s", response["error"])
             raise DerivClientError(f"Buy request failed: {response['error']}")
         return response["buy"]
 
