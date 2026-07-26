@@ -56,17 +56,58 @@ elsewhere.
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 from configs.duration_selection_schema import DurationSelectionConfig
 from configs.ev_schema import ExpectedValueConfig
 from ensemble.fusion_engine import monte_carlo_result_to_probability_estimate
 from expected_value.engine import ExpectedValueEngine
-from expected_value.types import ContractSpec, ContractType
+from expected_value.types import ContractSpec, ContractType, EVEstimate
 from monte_carlo.duration_selection_types import DurationCandidateEvaluation, DurationSelectionResult
 from monte_carlo.price_paths import MonteCarloPricePathSimulator
 from probability.types import ProbabilityEstimate
 
 NAN = float("nan")
+
+
+def _apply_duration_bias_penalty(
+    ev_estimate: EVEstimate, duration_ticks: int, config: DurationSelectionConfig,
+) -> EVEstimate:
+    """
+    See `DurationSelectionConfig.ev_penalty_per_tick_beyond_reference`'s
+    docstring for the full rationale — briefly, the Hurst fallback favors
+    longer durations in trending regimes with no offsetting cost, since
+    payout doesn't shrink with duration in this model the way it would on
+    a real broker's actual payout curve. This heuristically re-introduces
+    that missing cost as a flat per-tick EV deduction, applied uniformly
+    to every candidate so ranking stays comparable.
+    """
+    if not ev_estimate.is_valid or config.ev_penalty_per_tick_beyond_reference <= 0.0:
+        return ev_estimate
+    ticks_beyond_reference = max(0, duration_ticks - config.hurst_reference_duration_ticks)
+    if ticks_beyond_reference == 0:
+        return ev_estimate
+
+    penalty = config.ev_penalty_per_tick_beyond_reference * ticks_beyond_reference * ev_estimate.stake
+    adjusted_ev = ev_estimate.expected_value - penalty
+    adjusted_ev_pct = adjusted_ev / ev_estimate.stake if ev_estimate.stake > 0 else NAN
+    adjusted_score = (
+        adjusted_ev / ev_estimate.outcome_std if ev_estimate.outcome_std > 0 else NAN
+    )
+    still_positive = adjusted_ev > 0.0
+    return replace(
+        ev_estimate,
+        expected_value=adjusted_ev,
+        expected_value_pct=adjusted_ev_pct,
+        risk_adjusted_score=adjusted_score,
+        is_positive_ev=still_positive,
+        rejection_reason=(
+            None if still_positive
+            else f"Duration-bias EV penalty ({penalty:.4f}) for {duration_ticks} ticks "
+                 f"({ticks_beyond_reference} beyond the {config.hurst_reference_duration_ticks}-tick "
+                 f"reference) turned a marginal candidate negative."
+        ),
+    )
 
 
 def _hurst_from_persistence(persistence: float) -> float:
@@ -151,6 +192,7 @@ class DurationSelector:
                 payout=stake * assumed_payout_ratio, duration_ticks=duration_ticks,
             )
             ev_estimate = self._ev_engine.evaluate(probability_estimate, contract)
+            ev_estimate = _apply_duration_bias_penalty(ev_estimate, duration_ticks, self._config)
             candidates.append(
                 DurationCandidateEvaluation(
                     duration_ticks=duration_ticks, method=method,
