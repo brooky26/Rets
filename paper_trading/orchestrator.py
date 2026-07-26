@@ -121,6 +121,7 @@ from post_trade.types import CompletedTrade, PerformanceMetrics
 from probability.bayesian_logistic import BayesianLogisticRegression
 from probability.gbm import BaggedGBMEstimator
 from probability.types import ProbabilityEstimate
+from regime.hmm_detector import GaussianHMMRegimeDetector
 from regime.rule_based import RuleBasedRegimeDetector
 from risk.engine import RiskEngine
 from risk.types import TradeOutcome
@@ -163,12 +164,16 @@ class PaperTradingOrchestrator:
         monte_carlo_config: MonteCarloPricePathConfig | None = None,
         weight_learner: WeightLearner | None = None,
         duration_selection_config: DurationSelectionConfig | None = None,
+        challenger_regime_detector: GaussianHMMRegimeDetector | None = None,
+        enable_regime_consensus_gate: bool = False,
     ) -> None:
         self._paper_config = paper_config
         self._probability_config = probability_config
         self._bagged_gbm_config = bagged_gbm_config
         self._monte_carlo_config = monte_carlo_config
         self._regime_detector = regime_detector
+        self._challenger_regime_detector = challenger_regime_detector
+        self._enable_regime_consensus_gate = enable_regime_consensus_gate
         self._state_encoder = state_encoder
 
         self._ev_engine = ExpectedValueEngine(ev_config)
@@ -313,7 +318,10 @@ class PaperTradingOrchestrator:
         Returns {"settled": CompletedTrade | None, "decision": ExecutionDecision | None}
         for logging; never raises for ordinary "nothing to do" cases.
         """
-        result: dict = {"settled": None, "decision": None, "rankings": None, "duration_selection": None}
+        result: dict = {
+            "settled": None, "decision": None, "rankings": None,
+            "duration_selection": None, "regime_consensus": None,
+        }
 
         if symbol not in self._probability_models:
             return result
@@ -346,6 +354,26 @@ class PaperTradingOrchestrator:
             return result
 
         regime = self._regime_detector.classify(state)
+
+        if self._challenger_regime_detector is not None:
+            challenger_regime = self._challenger_regime_detector.classify(state)
+            agree = challenger_regime.regime == regime.regime
+            result["regime_consensus"] = {
+                "rule_based": regime.regime, "hmm": challenger_regime.regime, "agree": agree,
+            }
+            if self._enable_regime_consensus_gate and not agree:
+                # Disagreement gate: same "nothing to do this cycle" treatment as
+                # an invalid state or a no-edge probability estimate — this is a
+                # deliberate abstention, not an error, so it's logged plainly and
+                # the cycle ends here, before any of the more expensive scoring
+                # work below. See the module-level docstring's "Regime
+                # consensus" section for the full rationale.
+                self._latest_evaluations[symbol] = SymbolEvaluation(
+                    quality_score=0.0, epoch=candle.epoch, approved=False,
+                )
+                result["rankings"] = dict(self._latest_evaluations)
+                return result
+
         # Reference-horizon MC evidence (self._contract.duration_ticks) for fusion
         # input, since fusion must run BEFORE any duration is chosen — direction
         # is unknown yet, so this uses direction=1 (see the method's own docstring
@@ -605,12 +633,39 @@ class PaperTradingOrchestrator:
         candles. `new_detector` just needs to implement `.classify(state)
         -> RegimeClassification` — both `RuleBasedRegimeDetector` and
         `GaussianHMMRegimeDetector` do, so either can be passed here.
+
+        Kept for anyone still using the classic promote-and-swap flow.
+        Most new setups should prefer `set_challenger_regime_detector`
+        below instead — running both detectors side by side rather than
+        picking one winner to replace the other.
         """
         old_name = type(self._regime_detector).__name__
         self._regime_detector = new_detector
         logger.info(
             "Regime detector swapped: %s -> %s (Champion-Challenger promotion).",
             old_name, type(new_detector).__name__,
+        )
+
+    def set_challenger_regime_detector(self, detector: GaussianHMMRegimeDetector | None) -> None:
+        """
+        Registers (or clears, if `detector` is None) the HMM as a
+        standing second opinion that runs alongside the primary
+        (rule-based) detector every candle — this is the regime-consensus
+        approach: no swap, no single winner, both detectors are always
+        consulted once this is set. See `on_candle`'s regime-consensus
+        block for how agreement/disagreement is handled, and
+        `RegimeDetectionConfig.enable_regime_consensus_gate` for whether
+        disagreement actually blocks trading or is just logged for
+        observability.
+
+        Safe to call at any point, same as `update_regime_detector` — read
+        fresh via `.classify(state)` every `on_candle` call, never cached
+        across candles.
+        """
+        self._challenger_regime_detector = detector
+        logger.info(
+            "Regime consensus challenger %s.",
+            "cleared" if detector is None else f"set: {type(detector).__name__}",
         )
 
     @property
