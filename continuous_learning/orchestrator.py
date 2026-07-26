@@ -560,6 +560,59 @@ class ContinuousLearningOrchestrator:
         return scheduler
 
 
+def _refit_and_persist_hmm_challenger_if_enabled(config, states: list[MarketState], data_dir: str) -> None:
+    """
+    This is what actually makes the regime-consensus HMM keep learning
+    over time, rather than only ever being fit once per main-worker
+    restart against a single snapshot: called once per cron invocation
+    (see `_run_once_async`), refits a fresh Gaussian HMM against
+    whatever history is available *that day*, and pickles it to
+    `CL_HMM_PATH` (default `<CL_DATA_DIR>/hmm_regime_detector.pkl`) — the
+    exact path `main.py`'s `fit_hmm_challenger_if_enabled` checks for and
+    loads at its own next startup, in preference to fitting fresh itself.
+
+    Best-effort and independent of the probability-model daily cycle
+    around it: a failure here (insufficient valid states, a fitting
+    error) is logged and does not fail the cron run or block the rest of
+    `_run_once_async` — the main worker just keeps using whatever HMM
+    (or none) it last loaded.
+    """
+    import os
+    import pickle
+    from pathlib import Path
+
+    from regime.hmm_detector import GaussianHMMRegimeDetector
+
+    regime_cfg = config.regime_detection
+    if not regime_cfg.enable_hmm_promotion:
+        return
+
+    valid_states = [s for s in states if s.is_valid]
+    if len(valid_states) < regime_cfg.hmm.n_states * 2:
+        logger.info(
+            "Only %d valid states available — too few to refit the HMM regime-consensus "
+            "challenger this cycle (need >= %d) — skipping.",
+            len(valid_states), regime_cfg.hmm.n_states * 2,
+        )
+        return
+
+    hmm_path = os.environ.get("CL_HMM_PATH", str(Path(data_dir) / "hmm_regime_detector.pkl"))
+    try:
+        hmm_detector = GaussianHMMRegimeDetector(regime_cfg.hmm).fit(valid_states)
+        Path(hmm_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(hmm_path, "wb") as f:
+            pickle.dump(hmm_detector, f)
+        logger.info(
+            "Refit and persisted the HMM regime-consensus challenger to %s (%d valid states).",
+            hmm_path, len(valid_states),
+        )
+    except Exception as exc:  # noqa: BLE001 — this cycle's own retrain must not be blocked by this
+        logger.warning(
+            "HMM regime-consensus challenger refit failed this cycle (%s) — the main worker "
+            "keeps using whatever it last loaded (or none).", exc,
+        )
+
+
 async def _run_once_async(config_path: str) -> "DailyCycleReport":
     """
     Real implementation behind `--run-once` (Option C / external Railway
@@ -664,6 +717,8 @@ async def _run_once_async(config_path: str) -> "DailyCycleReport":
             f"{symbol}: no usable states produced from {len(candles)} fetched candles — "
             "cannot run a daily cycle this invocation."
         )
+
+    _refit_and_persist_hmm_challenger_if_enabled(config, states, data_dir)
 
     registry = ModelRegistry(JSONFileModelRegistryStore(registry_path))
     contract = ContractSpec(
