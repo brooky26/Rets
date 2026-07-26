@@ -10,9 +10,12 @@ from pydantic import BaseModel, Field, field_validator
 
 class DurationSelectionConfig(BaseModel):
     candidate_durations_ticks: list[int] = Field(
-        default=[3, 5, 8, 12, 20],
+        default=[3, 5, 7, 8, 10],
         description="Candidate contract durations (in ticks) evaluated every candle; the one "
-        "maximizing risk-adjusted EV among EV-positive candidates is selected.",
+        "maximizing risk-adjusted EV among EV-positive candidates is selected. Kept within "
+        "Deriv's confirmed live limit of 1-10 ticks for these symbols (a real "
+        "ContractBuyValidationError/TicksNumberLimits response, code_args: [1, 10]) — if you "
+        "add symbols with a different limit, verify it before widening this.",
     )
     mc_max_standard_error: float = Field(
         default=0.05,
@@ -34,6 +37,20 @@ class DurationSelectionConfig(BaseModel):
         "roughly match whatever gap the probability models' training labels were defined over "
         "(next-candle direction, by default one tick/candle apart).",
     )
+    ev_penalty_per_tick_beyond_reference: float = Field(
+        default=0.0008,
+        description="A deliberately simple correction for a real structural bias: the Hurst "
+        "fallback's analytical_confidence(d) = 0.5 + (p-0.5)*(d/d_ref)^(H-0.5) is monotonically "
+        "increasing in duration d whenever H > 0.5 (any persistent/trending regime) — and since "
+        "payout is modeled as a FLAT ratio regardless of duration (no real-world 'longer "
+        "contracts price in worse payout odds' cost), EV-maximization then mechanically favors "
+        "the longest candidate in trending regimes, not because it's genuinely best but because "
+        "nothing in the model penalizes waiting longer. This field subtracts "
+        "`this * stake * max(0, duration_ticks - hurst_reference_duration_ticks)` from each "
+        "candidate's expected_value before ranking — a heuristic time-cost, not a fitted one "
+        "(no real per-duration payout curve is wired in yet). Set to 0.0 to disable and restore "
+        "the old unpenalized behavior.",
+    )
 
     @field_validator("candidate_durations_ticks")
     @classmethod
@@ -43,6 +60,13 @@ class DurationSelectionConfig(BaseModel):
         if any(d <= 0 for d in v):
             raise ValueError("all candidate_durations_ticks must be positive")
         return sorted(set(v))
+
+    @field_validator("ev_penalty_per_tick_beyond_reference")
+    @classmethod
+    def _valid_penalty(cls, v: float) -> float:
+        if v < 0.0:
+            raise ValueError("ev_penalty_per_tick_beyond_reference must be >= 0")
+        return v
 
     @field_validator("mc_max_standard_error")
     @classmethod

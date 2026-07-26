@@ -71,8 +71,23 @@ class RuleBasedRegimeConfig(BaseModel):
 class GaussianHMMConfig(BaseModel):
     n_states: int = Field(default=4, description="Number of hidden regime states.")
     observation_dims: list[str] = Field(
-        default=["trend", "volatility", "persistence", "compression_expansion"],
-        description="Which MarketState dimensions form the HMM's observation vector.",
+        default=[
+            "trend", "volatility", "persistence", "compression_expansion",
+            "momentum", "acceleration", "complexity", "uncertainty",
+        ],
+        description=(
+            "Which MarketState dimensions form the HMM's observation vector. Deliberately wider "
+            "than the 4 dims RuleBasedRegimeConfig's thresholds use (trend, volatility, "
+            "persistence, compression_expansion) — those 4 are still what _label_states maps "
+            "learned clusters back onto (see hmm_detector.py), but fitting on the wider set gives "
+            "the HMM real information the rule-based detector never sees (momentum, acceleration, "
+            "complexity, uncertainty), rather than the same 4 numbers run through a different "
+            "formula. This is what makes the two detectors a genuine second opinion for the "
+            "regime-consensus gate (paper_trading.enable_regime_consensus_gate), not a mostly-"
+            "correlated echo of each other. Excludes 'noise' (low signal), 'liquidity' (a "
+            "synthetic-indices placeholder, see state_encoder/encoder.py), and 'market_phase' "
+            "(itself a rough derived proxy, not an independent primary signal)."
+        ),
     )
     em_max_iterations: int = 100
     em_tolerance: float = Field(
@@ -109,13 +124,26 @@ class RegimeDetectionConfig(BaseModel):
     hmm: GaussianHMMConfig = GaussianHMMConfig()
     enable_hmm_promotion: bool = Field(
         default=False,
-        description="If True, main.py runs regime/promotion.py's Champion-Challenger comparison "
-        "(rule-based vs HMM) once at startup, using the same historical states/closes gathered "
-        "for probability-model bootstrap. If the HMM significantly outperforms on realized "
-        "holdout trade PnL, it's swapped in as the live regime detector via "
-        "PaperTradingOrchestrator.update_regime_detector — otherwise rule-based remains active, "
-        "which is always the safe/default outcome (including when there isn't enough history "
-        "to run the comparison at all, or the HMM fails to fit).",
+        description="If True, main.py fits a GaussianHMMRegimeDetector at startup on the same "
+        "historical states/closes gathered for probability-model bootstrap, and registers it as "
+        "a standing regime-consensus challenger (see PaperTradingOrchestrator"
+        ".set_challenger_regime_detector) — both rule-based and HMM run every candle from then "
+        "on, rather than one replacing the other. (Prior to the regime-consensus design, this "
+        "flag instead triggered a one-shot Champion-Challenger promotion that could swap the HMM "
+        "in as the sole detector; that flow still exists in regime/promotion.py for anyone who "
+        "wants it, but is no longer what this flag wires up by default.) Fitting failure (e.g. "
+        "insufficient bootstrap history) leaves no challenger registered — rule-based operates "
+        "alone, the same safe fallback as before.",
+    )
+    enable_regime_consensus_gate: bool = Field(
+        default=False,
+        description="Only meaningful once enable_hmm_promotion has actually registered a "
+        "challenger. If True, a candle where rule-based and the HMM challenger disagree on the "
+        "regime label is treated as 'nothing to trade this cycle' (logged, not an error) — "
+        "PaperTradingOrchestrator.on_candle bails out before scoring/execution. If False, both "
+        "classifications are still computed and logged (result['regime_consensus']) for "
+        "observability, but disagreement does not block trading — useful for watching how often "
+        "the two would actually disagree before committing to the more conservative gated mode.",
     )
     hmm_promotion_train_fraction: float = Field(
         default=0.6,
