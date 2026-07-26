@@ -1,4 +1,4 @@
-environment: live
+environment: development
 
 market_data:
   connection:
@@ -81,4 +81,4 @@ continuous_learning:
 # ---------------------------------------------------------------------- #
 # environment: live               # (top of this file — currently "development")
 execution:
-  mode: "live"                      # "paper" | "live" — flipped for live execution against the DEMO account (DERIV_ACCOUNT_TYPE=demo in Railway keeps this virtual money)
+  mode: "paper"                      # "paper" | "live" — flipped for live execution against the DEMO account (DERIV_ACCOUNT_TYPE=demo in Railway keeps this virtual money)
