@@ -1,4 +1,4 @@
-environment: development
+environment: live
 
 market_data:
   connection:
@@ -81,4 +81,4 @@ continuous_learning:
 # ---------------------------------------------------------------------- #
 # environment: live               # (top of this file — currently "development")
 execution:
-  mode: "paper"                    # "paper" | "live" — see the block comment above before ever changing this
+  mode: "live"                    # "paper" | "live" — see the block comment above before ever changing this
