@@ -86,7 +86,7 @@ is currently live for those model types.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -137,11 +137,19 @@ class SymbolEvaluation:
     """Most recently computed opportunity evaluation for one symbol —
     tracked for every symbol on every candle, regardless of approval, so
     cross-symbol ranking always has each symbol's latest known standing
-    even for symbols whose own candle hasn't just completed."""
+    even for symbols whose own candle hasn't just completed.
+
+    `veto_reasons` carries `TradeOpportunity.veto_reasons` through to this
+    ranking snapshot — needed because `quality_score` alone can't
+    distinguish "below threshold" from "scored well but vetoed anyway"
+    (a hard EV/Risk gate, independent of quality_score — see
+    opportunity/scorer.py). Empty for candles that never reached full
+    scoring (e.g. a regime-consensus-gate skip, or before bootstrap)."""
 
     quality_score: float
     epoch: int
     approved: bool
+    veto_reasons: list[str] = field(default_factory=list)
 
 
 class PaperTradingOrchestrator:
@@ -418,6 +426,7 @@ class PaperTradingOrchestrator:
 
         self._latest_evaluations[symbol] = SymbolEvaluation(
             quality_score=opportunity.quality_score, epoch=candle.epoch, approved=opportunity.approved,
+            veto_reasons=opportunity.veto_reasons,
         )
         result["rankings"] = dict(self._latest_evaluations)
 
