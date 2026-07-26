@@ -102,7 +102,17 @@ class DerivConnectionConfig(BaseModel):
     max_reconnect_attempts: int | None = Field(
         default=None, description="None = retry forever."
     )
-    request_timeout_seconds: float = 15.0
+    request_timeout_seconds: float = Field(
+        default=25.0,
+        description="Was 15.0 — raised after measuring, across 90 real production timeouts, that "
+        "Deriv's actual proposal round-trip time for this account sits at a median of just "
+        "0.031s PAST the old 15.0s cutoff — i.e. nearly every proposal request was 'timing out' "
+        "locally by milliseconds despite succeeding server-side moments later (caught by the "
+        "shield()+forget mechanism in fetch_proposal, but too late to ever actually place a live "
+        "trade in time). 25.0 comfortably clears that typical case with margin, while the "
+        "shield()+forget safety net still handles the rare genuine outlier (one observed case "
+        "arrived a full 60s late).",
+    )
 
     @field_validator("symbols")
     @classmethod

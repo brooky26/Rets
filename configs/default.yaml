@@ -19,7 +19,7 @@ market_data:
     reconnect_max_backoff_seconds: 60.0
     reconnect_backoff_multiplier: 2.0
     max_reconnect_attempts: null
-    request_timeout_seconds: 15.0
+    request_timeout_seconds: 25.0  # was 15.0 — measured real Deriv proposal latency lands right at that cutoff (see configs/schema.py)
 
   historical:
     lookback_days: 30
@@ -81,4 +81,4 @@ continuous_learning:
 # ---------------------------------------------------------------------- #
 # environment: live               # (top of this file — currently "development")
 execution:
-  mode: "live"                    # "paper" | "live" — see the block comment above before ever changing this
+  mode: "live"                      # "paper" | "live" — flipped for live execution against the DEMO account (DERIV_ACCOUNT_TYPE=demo in Railway keeps this virtual money)
