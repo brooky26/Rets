@@ -30,16 +30,24 @@ STARTUP SEQUENCE, before live streaming begins:
      history for a symbol is genuinely shorter than the target, not a
      bug to "fix" by lowering the bar silently.
   3. If regime_detection.enable_hmm_promotion is True: the SAME
-     bootstrap (states, closes) are reused (no second fetch) to run
-     regime/promotion.py's Champion-Challenger comparison — rule-based
-     (champion, always the safe default) vs a freshly-fit Gaussian HMM
-     (challenger). If the HMM significantly outperforms on realized
-     holdout trade PnL, it's swapped in as the live regime detector via
-     PaperTradingOrchestrator.update_regime_detector; otherwise
-     rule-based stays active. This runs once at startup, not on a
-     schedule — see continuous_learning/orchestrator.py for the
-     scheduled probability-model retraining loop, which is a distinct
-     mechanism from this one-time regime-detector comparison.
+     bootstrap (states, closes) are reused (no second fetch) to fit a
+     Gaussian HMM per symbol, registered as a standing regime-consensus
+     CHALLENGER via PaperTradingOrchestrator.set_challenger_regime_detector
+     — NOT a promote-and-swap decision anymore. From here on, every
+     candle classifies regime with BOTH rule-based (primary, always
+     active) and the HMM; if they disagree and
+     regime_detection.enable_regime_consensus_gate is True, that candle
+     is treated as nothing-to-trade (logged, not an error). Fitting
+     failure (e.g. insufficient bootstrap history for a symbol) leaves
+     no challenger registered for that symbol — rule-based operates
+     alone, the same safe fallback as before. The classic one-shot
+     statistical promotion/swap flow this replaced still exists in
+     regime/promotion.py for anyone who wants it directly; it's just not
+     what this flag wires up by default anymore. Continuous learning of
+     the HMM itself (periodic refit as more data becomes available,
+     rather than only ever fitting once at each process startup) is
+     handled by continuous_learning/orchestrator.py's daily cron cycle —
+     see its module docstring.
   4. Live tick streaming begins, with every model family that was
      successfully bootstrapped already active and voting — nothing is
      sidelined for having less data than another model; see
@@ -86,6 +94,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 
 from configs.loader import load_config
 from continuous_learning.orchestrator import ContinuousLearningOrchestrator
@@ -100,7 +109,7 @@ from features.types import FeatureVector
 from model_registry.registry import ModelRegistry
 from model_registry.store import InMemoryModelRegistryStore
 from paper_trading.orchestrator import PaperTradingOrchestrator
-from regime.promotion import compare_regime_detectors
+from regime.hmm_detector import GaussianHMMRegimeDetector
 from regime.rule_based import RuleBasedRegimeDetector
 from regime.types import RegimeClassification
 from state_encoder.encoder import MarketStateEncoder
@@ -194,59 +203,90 @@ async def bootstrap_paper_trading(
     return replayed
 
 
-def run_hmm_promotion_if_enabled(
+def fit_hmm_challenger_if_enabled(
     config, orchestrator: PaperTradingOrchestrator,
     bootstrap_data: dict[str, tuple[list[MarketState], list[float]]],
 ) -> None:
     """
-    Runs once at startup, per symbol, reusing the SAME (states, closes)
-    already fetched for probability-model bootstrap — no second fetch.
-    Swaps the orchestrator's live regime detector to the fitted HMM only
-    when Champion-Challenger promotion actually succeeds; logs and keeps
-    rule-based otherwise (including when there isn't enough holdout data
-    to even attempt the comparison, or the HMM fails to fit — both are
-    treated as "stay with the safe default," not errors).
+    Runs once at startup. If `continuous_learning/orchestrator.py`'s daily
+    cron (Option C) has persisted a refit HMM (`CL_HMM_PATH`, or
+    `<CL_DATA_DIR>/hmm_regime_detector.pkl`), that's loaded and registered
+    as the regime-consensus challenger directly — this is how the HMM
+    actually keeps learning over time (a fresh daily fit against whatever
+    history is available that day), rather than only ever being fit once
+    per process restart against a single bootstrap snapshot. Only when no
+    persisted HMM is found does this fall back to fitting fresh here,
+    reusing the SAME (states, closes) already fetched for
+    probability-model bootstrap (no second fetch) — a reasonable
+    first-run/no-cron fallback, but note it never improves across
+    restarts on its own the way the cron-fed path does.
+
+    Either way, the result is registered via
+    `PaperTradingOrchestrator.set_challenger_regime_detector` — NOT a
+    promote-and-swap decision. Both rule-based and the HMM run every
+    candle from here on; see `on_candle`'s regime-consensus block.
+
+    Same shared-detector scope limit as the classic promotion flow this
+    replaced, for the fresh-fit fallback path: `orchestrator` has ONE
+    regime detector (and now one challenger) shared across ALL symbols
+    (see `run()` below), so only the FIRST symbol with enough bootstrap
+    history to fit an HMM actually gets used there — per-symbol
+    challengers would be a larger change. Fitting failure (insufficient
+    data, or every symbol lacking enough) leaves no challenger registered
+    at all — rule-based operates alone, same safe fallback as before.
     """
     regime_cfg = config.regime_detection
     if not regime_cfg.enable_hmm_promotion:
         return
 
-    contract = ContractSpec(
-        contract_type=ContractType.RISE_FALL, stake=config.paper_trading.stake,
-        payout=config.paper_trading.stake * config.paper_trading.assumed_payout_ratio,
-        duration_ticks=config.paper_trading.duration_ticks,
+    # Prefer a persisted HMM from the continuous-learning cron (Option C) over
+    # fitting fresh here: the cron refits daily against whatever fresh history
+    # is available at that moment (see continuous_learning/orchestrator.py's
+    # _run_once_async), so its HMM has seen strictly more/more-recent data
+    # than this process's own one-off bootstrap fetch ever could — a fresh
+    # fit here is only a fallback for symbols/setups without that cron
+    # service running at all. Same env var the cron writes to by default;
+    # CL_HMM_PATH overrides it directly if you've customized either side.
+    persisted_path = os.environ.get("CL_HMM_PATH") or (
+        os.path.join(os.environ["CL_DATA_DIR"], "hmm_regime_detector.pkl")
+        if os.environ.get("CL_DATA_DIR") else None
     )
+    if persisted_path and os.path.exists(persisted_path):
+        try:
+            import pickle
+            with open(persisted_path, "rb") as f:
+                hmm_detector = pickle.load(f)
+            orchestrator.set_challenger_regime_detector(hmm_detector)
+            logger.info(
+                "Loaded HMM regime-consensus challenger from %s (the continuous-learning "
+                "cron's last refit) — skipping a fresh fit from this process's own bootstrap.",
+                persisted_path,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 — any load failure just falls through to fitting fresh
+            logger.warning(
+                "Failed to load persisted HMM from %s (%s) — falling back to fitting fresh "
+                "from this process's own bootstrap.", persisted_path, exc,
+            )
 
     for symbol, (states, closes) in bootstrap_data.items():
-        if len(states) < 20:  # far below any sane train/holdout split — not worth attempting
-            logger.info("%s: too little bootstrap history to attempt HMM promotion — skipping.", symbol)
+        valid_states = [s for s in states if s.is_valid]
+        if len(valid_states) < regime_cfg.hmm.n_states * 2:
+            logger.info("%s: too little bootstrap history to fit an HMM challenger — skipping.", symbol)
             continue
         try:
-            decision, hmm_detector = compare_regime_detectors(
-                states, closes,
-                probability_config=config.probability_estimation.bayesian_logistic,
-                ev_config=config.expected_value, risk_config=config.risk,
-                opportunity_config=config.opportunity_scoring, contract=contract,
-                champion_challenger_config=config.champion_challenger,
-                hmm_config=regime_cfg.hmm, rule_based_config=regime_cfg.rule_based,
-                starting_equity=config.paper_trading.starting_equity,
-                train_fraction=regime_cfg.hmm_promotion_train_fraction,
-            )
+            hmm_detector = GaussianHMMRegimeDetector(regime_cfg.hmm).fit(valid_states)
         except ValueError as exc:
-            logger.info("%s: HMM promotion comparison could not run (%s) — staying with rule-based.", symbol, exc)
+            logger.info("%s: HMM challenger fit failed (%s) — trying the next symbol.", symbol, exc)
             continue
 
+        orchestrator.set_challenger_regime_detector(hmm_detector)
         logger.info(
-            "%s: regime promotion decision — promote=%s (%s)", symbol, decision.promote, decision.reason,
+            "%s: HMM challenger fitted on %d states and registered for regime consensus "
+            "(gate %s).", symbol, len(valid_states),
+            "enabled" if regime_cfg.enable_regime_consensus_gate else "disabled (observation-only)",
         )
-        if decision.promote and hmm_detector is not None:
-            # NOTE: main.py currently shares ONE regime_detector instance across ALL
-            # symbols (see run()) — promoting based on one symbol's comparison swaps
-            # the detector used for every symbol. This is a known v1 scope limit,
-            # consistent with regime_detector being constructed once, globally, in
-            # run() below; per-symbol regime detectors would be a larger change.
-            orchestrator.update_regime_detector(hmm_detector)
-            break  # only the first successful promotion actually gets applied, given the shared-detector scope note above
+        break  # only the first successful fit actually gets applied, given the shared-detector scope note above
 
 
 async def run(config_path: str) -> None:
@@ -353,6 +393,33 @@ async def run(config_path: str) -> None:
             )
             logger.info("RANKINGS (this cycle, * = approved on own merits): %s", table)
 
+            # RANKINGS only shows quality_score vs the adaptive threshold — it can't
+            # distinguish "below threshold" from an unconditional EV/Risk gate veto,
+            # which blocks a trade regardless of how high quality_score is (see
+            # opportunity/scorer.py, opportunity/types.py's TradeOpportunity
+            # docstring). Without this, a symbol can sit above threshold every
+            # cycle and still never get approved, with literally nothing in the
+            # logs explaining why. Log the top candidate's veto reasons whenever
+            # it wasn't approved, so that's answerable from logs alone.
+            top_symbol, top_evaluation = ranked[0]
+            if not top_evaluation.approved and top_evaluation.veto_reasons:
+                logger.info(
+                    "TOP CANDIDATE %s not approved despite highest quality_score=%.3f: %s",
+                    top_symbol, top_evaluation.quality_score, "; ".join(top_evaluation.veto_reasons),
+                )
+
+        # Same explainability gap as above, different cause: a regime-consensus-gate
+        # skip (see paper_trading/orchestrator.py's on_candle) bails out BEFORE
+        # scoring ever runs, so that symbol's SymbolEvaluation has no veto_reasons
+        # to log above — without this, it just looks like a symbol silently never
+        # scored anything, with nothing in the logs pointing at the actual cause.
+        consensus = result["regime_consensus"]
+        if consensus is not None and not consensus["agree"]:
+            logger.info(
+                "%s: regime consensus disagreement — rule_based=%s, hmm=%s.",
+                candle.symbol, consensus["rule_based"], consensus["hmm"],
+            )
+
     async def on_tick(tick: Tick) -> None:
         await store.write_ticks([tick])
         completed_candle = aggregator.on_tick(tick)
@@ -393,6 +460,7 @@ async def run(config_path: str) -> None:
                 if (paper_cfg.use_ensemble_fusion or paper_cfg.use_duration_selection) else None
             ),
             duration_selection_config=config.duration_selection if paper_cfg.use_duration_selection else None,
+            enable_regime_consensus_gate=config.regime_detection.enable_regime_consensus_gate,
         )
 
     try:
@@ -403,7 +471,7 @@ async def run(config_path: str) -> None:
                 md_cfg.connection.symbols, md_cfg.historical.candle_granularity_seconds,
                 target_candle_count,
             )
-            run_hmm_promotion_if_enabled(config, orchestrator, bootstrap_data)
+            fit_hmm_challenger_if_enabled(config, orchestrator, bootstrap_data)
 
         if cl_orchestrator is not None:
             def _cl_data_provider():
