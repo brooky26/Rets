@@ -67,6 +67,14 @@ logger = logging.getLogger(__name__)
 
 TickCallback = Callable[[Tick], Awaitable[None]]
 ConnectionEventCallback = Callable[[ConnectionEvent], Awaitable[None]]
+# Fired when a buy()/buy_direct() call already timed out locally but Deriv's
+# response then arrives late and shows a contract WAS opened. Args are
+# (symbol, buy_result) where buy_result is the raw `buy` dict (contract_id,
+# buy_price, payout, ...). Without this hook, _on_late_buy_response could only
+# log the fact — nothing downstream (risk equity, ContractOutcomeTracker,
+# post-trade analytics) ever learned the contract exists. See that method's
+# docstring for the full history of why this was previously log-only.
+LateContractCallback = Callable[[str, dict], Awaitable[None]]
 
 
 class DerivClientError(Exception):
@@ -206,12 +214,14 @@ class DerivWebSocketClient:
         on_tick: TickCallback,
         on_connection_event: ConnectionEventCallback | None = None,
         otp_bootstrap: DerivOTPBootstrap | None = None,
+        on_late_contract: LateContractCallback | None = None,
     ) -> None:
         self._cfg = connection_config
         self._hist_cfg = historical_config
         self._validator = integrity_validator
         self._on_tick = on_tick
         self._on_connection_event = on_connection_event
+        self._on_late_contract = on_late_contract
         self._otp = otp_bootstrap or DerivOTPBootstrap(connection_config)
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._req_id_counter = 0
@@ -878,14 +888,24 @@ class DerivWebSocketClient:
         logger.warning(
             "IMPORTANT: a buy request (%s) that already timed out "
             "locally actually SUCCEEDED server-side — contract_id=%s, "
-            "buy_price=%s, payout=%s. This contract is real and open but was "
-            "never returned to the caller, since it had already given up and "
-            "reported an error — reconcile this against the account.",
+            "buy_price=%s, payout=%s. This contract is real and open; %s",
             context,
             buy_result.get("contract_id"),
             buy_result.get("buy_price"),
             buy_result.get("payout"),
+            "handing off to on_late_contract for tracking." if self._on_late_contract is not None
+            else "NO on_late_contract callback is registered — this contract is untracked "
+                 "(no settlement polling, no equity/risk accounting, no post-trade record) "
+                 "until someone manually reconciles it against the account.",
         )
+        if self._on_late_contract is not None:
+            # context is "buy_direct:{symbol}" from buy_direct(), or a real
+            # proposal_id from buy() (which has no bare symbol available here) —
+            # callers should treat `context` as an opaque identifier, not assume
+            # its shape. Scheduled as a task, same as _on_late_proposal_response
+            # above: this runs inside an asyncio done-callback, which must never
+            # raise or await directly.
+            asyncio.get_event_loop().create_task(self._on_late_contract(context, buy_result))
 
     async def check_contract_status(self, contract_id: str) -> dict:
         """
