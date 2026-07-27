@@ -11,10 +11,8 @@ than one:
      at construction time (fails loudly and immediately, not on the
      first trade attempt) so a single misconfigured flag can never
      accidentally enable real trading.
-  3. Even once live, every execution re-validates the live proposal
-     against what the upstream decision (EV/Risk/Opportunity Scoring)
-     was actually based on, and aborts rather than trades if the market
-     has drifted too far in the time between scoring and execution.
+  3. Position sizing and per-trade risk limits (Risk gate, upstream of
+     this module) are unaffected by anything below.
 
 Contract type mapping
 -----------------------
@@ -26,31 +24,41 @@ NotImplementedError rather than silently mis-mapping it to the wrong
 Deriv contract code, which would be a much worse failure mode than an
 explicit error.
 
-Staleness check
-------------------
-The EV/Risk/Opportunity decision chain was computed against a
-*hypothetical* ContractSpec's reward_to_risk. By the time execution
-actually runs, real market conditions (and Deriv's own live pricing)
-may have moved. Before buying, the engine recomputes reward_to_risk from
-the live proposal and compares:
+One-step buy (default) — no pre-trade drift check anymore
+------------------------------------------------------------
+This used to be a two-step flow: fetch_proposal() for a live quote, check
+it against the EV/Risk decision's assumptions, abort if drifted too far,
+then buy(proposal_id, price). It is now `broker_client.buy_direct(...)` —
+ONE request that quotes and buys atomically, adopted specifically to cut
+the number of round-trips exposed to Deriv's response-timing behavior in
+half (see data/deriv_client.py's buy_direct docstring for the production
+evidence behind this).
 
-    live_reward_to_risk = (proposal.payout - proposal.ask_price) / proposal.ask_price
-    drift = |live_reward_to_risk - decision_reward_to_risk| / decision_reward_to_risk
-
-If `drift > max_payout_drift_pct`, the trade is aborted — trading on a
-stale assumption is exactly the kind of thing a research platform should
-refuse to do silently.
+This is a real, deliberate trade-off, not a strict improvement: the old
+flow could see the live price BEFORE committing money and abort if it
+had drifted too far from what the decision was based on. buy_direct has
+no such checkpoint — you commit to whatever price Deriv fills at. What
+replaces it is a POST-hoc check: `max_payout_drift_pct` is still read
+from config and still compared against the ACTUAL fill, but only to log
+a clear warning after the fact (`_log_drift_warning_if_needed`) — since
+the trade has already happened by the time this runs, it can inform
+future tuning but cannot abort anything. Adopted as the platform default
+per an explicit, informed choice weighing round-trip risk against this
+lost safety rail — not a silent regression.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from configs.execution_schema import ExecutionConfig
 from expected_value.types import ContractSpec, ContractType, EVEstimate
 from execution.types import BrokerClient, ExecutionDecision, ExecutionMode
 from opportunity.types import TradeOpportunity
 from risk.types import RiskAssessment
+
+logger = logging.getLogger(__name__)
 
 _CONTRACT_TYPE_CODES = {1: "CALL", -1: "PUT"}
 
@@ -149,7 +157,7 @@ class ExecutionEngine:
 
         contract_type_code = _CONTRACT_TYPE_CODES[ev.direction]
         try:
-            proposal = await self._broker_client.fetch_proposal(
+            buy_result = await self._broker_client.buy_direct(
                 symbol=opportunity.symbol,
                 contract_type_code=contract_type_code,
                 stake=risk.recommended_stake,
@@ -158,53 +166,7 @@ class ExecutionEngine:
             )
         except asyncio.TimeoutError:
             # asyncio.TimeoutError.__str__() is "" — without this branch it
-            # gets logged as an unhelpful blank "Proposal request failed: ".
-            return self._error(
-                opportunity, risk.recommended_stake,
-                "Proposal request timed out waiting for Deriv's response "
-                "(no error from the API — the request just never came back "
-                "within request_timeout_seconds).",
-            )
-        except Exception as exc:  # noqa: BLE001 — broker failures are reported, not propagated raw
-            return self._error(
-                opportunity, risk.recommended_stake,
-                f"Proposal request failed: {exc!r} (type={type(exc).__name__})",
-            )
-
-        ask_price = float(proposal["ask_price"])
-        live_payout = float(proposal["payout"])
-
-        if ask_price <= 0:
-            return self._error(opportunity, risk.recommended_stake, "Live proposal returned a non-positive ask_price.")
-
-        live_reward_to_risk = (live_payout - ask_price) / ask_price
-        decision_reward_to_risk = ev.reward_to_risk
-        drift = (
-            abs(live_reward_to_risk - decision_reward_to_risk) / decision_reward_to_risk
-            if decision_reward_to_risk > 0
-            else float("inf")
-        )
-
-        if drift > self._config.max_payout_drift_pct:
-            return self._skip(
-                opportunity, risk.recommended_stake,
-                f"Live proposal reward-to-risk ({live_reward_to_risk:.4f}) drifted "
-                f"{drift:.2%} from the decision basis ({decision_reward_to_risk:.4f}), "
-                f"exceeding the {self._config.max_payout_drift_pct:.2%} tolerance — aborting "
-                "rather than trading on stale numbers.",
-            )
-
-        max_acceptable_price = risk.recommended_stake * (1.0 + self._config.price_slippage_tolerance_pct)
-        if ask_price > max_acceptable_price:
-            return self._skip(
-                opportunity, risk.recommended_stake,
-                f"Live ask_price {ask_price:.2f} exceeds the maximum acceptable "
-                f"{max_acceptable_price:.2f} given the slippage tolerance — aborting.",
-            )
-
-        try:
-            buy_result = await self._broker_client.buy(proposal["id"], ask_price)
-        except asyncio.TimeoutError:
+            # gets logged as an unhelpful blank "Buy request failed: ".
             return self._error(
                 opportunity, risk.recommended_stake,
                 "Buy request timed out waiting for Deriv's response "
@@ -213,22 +175,60 @@ class ExecutionEngine:
                 "still have been bought on Deriv's side even though we never "
                 "got confirmation — check the account before retrying.",
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 — broker failures are reported, not propagated raw
             return self._error(
                 opportunity, risk.recommended_stake,
                 f"Buy request failed: {exc!r} (type={type(exc).__name__})",
             )
+
+        buy_price = float(buy_result["buy_price"]) if "buy_price" in buy_result else risk.recommended_stake
+        live_payout = float(buy_result.get("payout", 0.0))
+        self._log_drift_warning_if_needed(opportunity, ev, buy_price, live_payout)
 
         return ExecutionDecision(
             symbol=opportunity.symbol,
             epoch=opportunity.epoch,
             mode=ExecutionMode.LIVE,
             action="buy",
-            stake=ask_price,
-            payout=float(buy_result.get("payout", live_payout)),
+            stake=buy_price,
+            payout=live_payout,
             contract_id=str(buy_result["contract_id"]),
-            reason="Live buy executed.",
+            reason="Live buy executed (one-step buy_direct).",
         )
+
+    def _log_drift_warning_if_needed(
+        self, opportunity: TradeOpportunity, ev: EVEstimate, buy_price: float, live_payout: float,
+    ) -> None:
+        """
+        POST-hoc replacement for the old PRE-trade drift check — see this
+        module's docstring for why buy_direct has no checkpoint to abort
+        at. This can only inform (log a clear warning for anyone tuning
+        max_payout_drift_pct or reviewing trade quality after the fact);
+        it cannot undo a trade that's already happened. Never raises —
+        a logging-only check must not be able to fail the trade it's
+        reporting on.
+        """
+        if buy_price <= 0:
+            return
+        try:
+            live_reward_to_risk = (live_payout - buy_price) / buy_price
+            decision_reward_to_risk = ev.reward_to_risk
+            drift = (
+                abs(live_reward_to_risk - decision_reward_to_risk) / decision_reward_to_risk
+                if decision_reward_to_risk > 0
+                else float("inf")
+            )
+            if drift > self._config.max_payout_drift_pct:
+                logger.warning(
+                    "%s: filled reward-to-risk (%.4f) drifted %.2f%% from the decision basis "
+                    "(%.4f), exceeding the %.2f%% tolerance — this already happened (buy_direct "
+                    "has no pre-trade abort point, see execution/engine.py's docstring); logged "
+                    "for review, not blocked.",
+                    opportunity.symbol, live_reward_to_risk, drift * 100, decision_reward_to_risk,
+                    self._config.max_payout_drift_pct * 100,
+                )
+        except Exception:  # noqa: BLE001 — this is an informational check only, never fatal
+            logger.debug("%s: drift warning check itself failed — skipping.", opportunity.symbol, exc_info=True)
 
     # ------------------------------------------------------------------ #
     # Helpers
