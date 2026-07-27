@@ -284,7 +284,7 @@ class DerivWebSocketClient:
 
         url = await self._resolve_connect_url()
         async with websockets.connect(
-            url, ping_interval=self._cfg.ping_interval_seconds
+            url, ping_interval=self._cfg.ping_interval_seconds, ping_timeout=self._cfg.ping_timeout_seconds,
         ) as ws:
             self._ws = ws
             self._reconnect_attempt = 0
