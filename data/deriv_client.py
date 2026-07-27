@@ -51,6 +51,7 @@ import asyncio
 import functools
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
@@ -723,6 +724,91 @@ class DerivWebSocketClient:
         )
         asyncio.get_event_loop().create_task(self._forget_by_id(subscription_id))
 
+    async def buy_direct(
+        self,
+        symbol: str,
+        contract_type_code: str,
+        stake: float,
+        duration_ticks: int,
+        currency: str = "USD",
+    ) -> dict:
+        """
+        Fetches a quote and buys it in ONE request/response, instead of
+        fetch_proposal() then buy() as two sequential round-trips. This is
+        now the default live execution path (see execution/engine.py) —
+        adopted specifically to cut the number of round-trips exposed to
+        Deriv's response-timing behavior in half, after production
+        evidence showed proposal timeouts recurring at BOTH 15s and 25s
+        request_timeout_seconds configurations (logs_1785063927056.csv,
+        logs_1785066902526.csv) — a pattern that tracks our OWN configured
+        timeout rather than a fixed Deriv-side latency, which is the real
+        open question this method's logging below is designed to resolve,
+        not just work around.
+
+        Trade-off, stated plainly: the two-step flow let execution/engine.py
+        check the live proposal's actual price/payout against the EV/Risk
+        decision's assumptions BEFORE committing to a real purchase, and
+        abort if it had drifted too far. This one-step call has no such
+        checkpoint — you commit to whatever price Deriv fills at. Adopted
+        as the default per an explicit, informed choice (this trade-off was
+        raised and accepted) — not a silent removal of that safety rail.
+
+        Returns the raw `buy` dict from Deriv's response (contract_id,
+        buy_price, payout, ...).
+        """
+        if self._ws is None:
+            raise DerivClientError("Cannot buy: not connected.")
+
+        req_id = self._next_req_id()
+        request = {
+            "buy": "1",
+            "price": stake,
+            "parameters": {
+                "amount": stake,
+                "basis": "stake",
+                "contract_type": contract_type_code,
+                "currency": currency,
+                "duration": duration_ticks,
+                "duration_unit": "t",
+                "underlying_symbol": symbol,
+            },
+            "req_id": req_id,
+        }
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending[req_id] = future
+
+        # Deliberately logged around the send() call itself, not just at entry to
+        # this method — see this method's docstring. If a future log shows a large
+        # gap between "opportunity approved" and this line, the delay is in OUR
+        # OWN pipeline (something blocking the event loop before we ever get to
+        # sending), not in Deriv's response time. If instead the gap between this
+        # line and a timeout/response is what's large, the delay is genuinely on
+        # Deriv's side. Today's evidence hasn't yet distinguished these.
+        send_started_at = time.monotonic()
+        logger.info("%s: sending one-step buy_direct request now (req_id=%d).", symbol, req_id)
+        await self._ws.send(json.dumps(request))
+        logger.info(
+            "%s: buy_direct request sent (took %.3fs to hand off to the socket).",
+            symbol, time.monotonic() - send_started_at,
+        )
+
+        try:
+            # Same shield() reasoning as fetch_proposal/buy above: a client-side
+            # timeout must not cancel `future` outright, or a late-but-real
+            # response has nothing left to resolve and any contract it opened
+            # would go completely unnoticed — the highest-stakes version of that
+            # risk in this file, since this IS the real trade now, not a proposal.
+            response = await asyncio.wait_for(
+                asyncio.shield(future), timeout=self._cfg.request_timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            future.add_done_callback(functools.partial(self._on_late_buy_response, f"buy_direct:{symbol}"))
+            raise
+        self._pending.pop(req_id, None)
+        if response.get("error"):
+            raise DerivClientError(f"Direct buy request failed: {response['error']}")
+        return response["buy"]
+
     async def buy(self, proposal_id: str, price: float) -> dict:
         """
         Execute a buy against a previously-fetched proposal. Returns the
@@ -766,33 +852,36 @@ class DerivWebSocketClient:
             raise DerivClientError(f"Buy request failed: {response['error']}")
         return response["buy"]
 
-    def _on_late_buy_response(self, proposal_id: str, future: asyncio.Future) -> None:
+    def _on_late_buy_response(self, context: str, future: asyncio.Future) -> None:
         """
-        Done-callback attached only when a buy() call has already timed out
-        locally. If Deriv's response arrives after all, this logs it —
-        contract_id and all — since the caller already gave up and reported
-        an error, so this is the only remaining way to surface that a real
-        contract may now be open. This runs as an asyncio done-callback, so
-        it must never raise.
+        Done-callback attached only when a buy() or buy_direct() call has
+        already timed out locally. If Deriv's response arrives after all,
+        this logs it — contract_id and all — since the caller already gave
+        up and reported an error, so this is the only remaining way to
+        surface that a real contract may now be open. `context` is either
+        a real proposal_id (from buy()) or a "buy_direct:{symbol}" label
+        (from buy_direct(), which has no proposal_id concept) — either way
+        it's just for identifying which request this was in the logs. This
+        runs as an asyncio done-callback, so it must never raise.
         """
         if future.cancelled() or future.exception() is not None:
             return
         response = future.result()
         if response.get("error"):
             logger.warning(
-                "A buy request for proposal_id=%s that already timed out locally "
+                "A buy request (%s) that already timed out locally "
                 "was actually rejected server-side: %s — no contract was opened.",
-                proposal_id, response["error"],
+                context, response["error"],
             )
             return
         buy_result = response.get("buy", {})
         logger.warning(
-            "IMPORTANT: a buy request for proposal_id=%s that already timed out "
+            "IMPORTANT: a buy request (%s) that already timed out "
             "locally actually SUCCEEDED server-side — contract_id=%s, "
             "buy_price=%s, payout=%s. This contract is real and open but was "
             "never returned to the caller, since it had already given up and "
             "reported an error — reconcile this against the account.",
-            proposal_id,
+            context,
             buy_result.get("contract_id"),
             buy_result.get("buy_price"),
             buy_result.get("payout"),
