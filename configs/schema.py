@@ -96,6 +96,17 @@ class DerivConnectionConfig(BaseModel):
         description="Deriv symbol codes for Step Index 100/200/300/400/500.",
     )
     ping_interval_seconds: float = 20.0
+    ping_timeout_seconds: float = Field(
+        default=40.0,
+        description="Was implicitly the websockets library's own default (20.0, same value as "
+        "ping_interval_seconds) — raised after production logs showed real "
+        "ConnectionClosedError(..., 'keepalive ping timeout') disconnects coinciding with the "
+        "same slow-response stretches (25-50s) measured on buy_direct calls. If a pong is "
+        "delayed that long during one of those stretches with the old 20s timeout, the "
+        "websockets library concludes the connection is dead and force-closes it — even though "
+        "it's just slow, not actually dead. 40.0 gives real headroom above the measured slow "
+        "case without waiting so long that a truly dead connection goes undetected for too long.",
+    )
     reconnect_initial_backoff_seconds: float = 1.0
     reconnect_max_backoff_seconds: float = 60.0
     reconnect_backoff_multiplier: float = 2.0
