@@ -123,6 +123,7 @@ from probability.gbm import BaggedGBMEstimator
 from probability.types import ProbabilityEstimate
 from regime.hmm_detector import GaussianHMMRegimeDetector
 from regime.rule_based import RuleBasedRegimeDetector
+from regime.types import RegimeLabel
 from risk.engine import RiskEngine
 from risk.types import TradeOutcome
 from state_encoder.encoder import MarketStateEncoder
@@ -150,6 +151,25 @@ class SymbolEvaluation:
     epoch: int
     approved: bool
     veto_reasons: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class SignalReading:
+    """One signal source's contribution to a single trade decision — either
+    a probability model (bayesian_logistic, bagged_gbm, monte_carlo_gbm) or
+    a regime detector (rule_based, hmm). `expected_direction` is only
+    meaningful for probability models (+1/-1/0); regime detectors don't
+    have a directional prediction, so it's left at 0 and `agrees` is
+    reported as None (not False) for those rows — "not applicable" is a
+    different answer than "disagrees", and collapsing them would be
+    misleading in the logged table.
+    """
+
+    name: str
+    kind: str  # "probability" | "regime"
+    detail: str  # e.g. "up" / "down" / "no edge", or a RegimeLabel value
+    confidence: float
+    expected_direction: int = 0
 
 
 class PaperTradingOrchestrator:
@@ -313,6 +333,89 @@ class PaperTradingOrchestrator:
     def is_bootstrapped(self, symbol: str) -> bool:
         return symbol in self._probability_models
 
+    async def register_late_contract(self, context: str, buy_result: dict) -> None:
+        """
+        Receiving end of `DerivWebSocketClient`'s `on_late_contract`
+        callback (see data/deriv_client.py's `_on_late_buy_response`): a
+        buy already timed out locally and was reported as an error, but
+        Deriv's real response then arrived showing a contract WAS opened.
+        Without this, that contract was only ever logged — never
+        registered anywhere, so it would never settle, never update
+        equity, and never appear in post-trade analytics, despite being a
+        real open position.
+
+        Honest limitation: by the time this fires, the original
+        `TradeOpportunity` context (direction, regime, predicted
+        probability, quality score) that led to the buy is gone — it lived
+        in `on_candle`'s local variables for the call that errored out, not
+        anywhere this method can reach. This registers the contract with
+        placeholder values for those descriptive fields (clearly marked
+        below) so it can still be correctly settled and counted in
+        equity/PnL — which does not depend on them (see
+        `_poll_live_settlement_if_any`, which settles from Deriv's own
+        reported pnl, never from `pending.direction`). Only the descriptive
+        analytics fields on the resulting `CompletedTrade` are unknown, not
+        the financial outcome.
+        """
+        if not context.startswith("buy_direct:"):
+            # A real buy() (two-step proposal+buy) call has no bare symbol in
+            # `context` (it's a proposal_id) — there's no `_pending_trades` key
+            # to register this under. Surfaced loudly rather than guessed at.
+            logger.warning(
+                "Late contract recovered from a two-step buy() call (context=%s) — "
+                "cannot auto-register (no symbol available from a proposal_id). "
+                "contract_id=%s is real and open; reconcile it against the account manually.",
+                context, buy_result.get("contract_id"),
+            )
+            return
+
+        symbol = context.removeprefix("buy_direct:")
+        contract_id = buy_result.get("contract_id")
+        if contract_id is None:
+            logger.warning(
+                "%s: register_late_contract called with no contract_id in buy_result (%s) — "
+                "nothing to register.", symbol, buy_result,
+            )
+            return
+
+        if self._outcome_tracker is None:
+            logger.warning(
+                "%s: late contract_id=%s recovered, but no broker_client/outcome_tracker is "
+                "configured — cannot poll for settlement. Reconcile against the account manually.",
+                symbol, contract_id,
+            )
+            return
+
+        existing = self._pending_trades.get(symbol)
+        if existing is not None:
+            logger.warning(
+                "%s: late contract_id=%s recovered, but a trade is already pending for this "
+                "symbol (contract_id=%s) — refusing to overwrite it. contract_id=%s is still real "
+                "and open; reconcile it against the account manually.",
+                symbol, contract_id, existing.contract_id, contract_id,
+            )
+            return
+
+        self._pending_trades[symbol] = PendingTrade(
+            symbol=symbol,
+            entry_epoch=-1,  # unknown — see docstring; not used by live (broker-polled) settlement
+            entry_close=0.0,  # unknown — likewise unused by live settlement
+            direction=0,  # unknown — real pnl comes from Deriv directly, not this field
+            stake=buy_result.get("buy_price", 0.0) or 0.0,
+            payout=buy_result.get("payout", 0.0) or 0.0,
+            predicted_probability=NAN,  # unknown — original opportunity context was lost
+            regime_at_entry=RegimeLabel.RANDOM_WALK,  # placeholder — see docstring, not "no edge"
+            quality_score_at_entry=0.0,  # unknown
+            contract_id=contract_id,
+        )
+        logger.info(
+            "%s: late contract_id=%s registered for live settlement polling (stake=%.2f). "
+            "Descriptive fields (direction/regime/probability/quality_score) are placeholders — "
+            "the original decision context was lost when the buy call timed out — but the real "
+            "pnl will be polled from Deriv and correctly applied to equity and post-trade stats.",
+            symbol, contract_id, buy_result.get("buy_price", 0.0) or 0.0,
+        )
+
     # ------------------------------------------------------------------ #
     # Live per-candle decision loop
     # ------------------------------------------------------------------ #
@@ -329,6 +432,7 @@ class PaperTradingOrchestrator:
         result: dict = {
             "settled": None, "decision": None, "rankings": None,
             "duration_selection": None, "regime_consensus": None,
+            "signal_agreement": None,
         }
 
         if symbol not in self._probability_models:
@@ -387,7 +491,21 @@ class PaperTradingOrchestrator:
         # is unknown yet, so this uses direction=1 (see the method's own docstring
         # for why that's still directionally meaningful for fusion purposes).
         mc_result = self._compute_mc_result_if_configured(symbol, state, ev_direction_hint=None)
-        probability = self._predict_probability(symbol, state, regime, mc_result)
+        probability, signal_readings = self._predict_probability(symbol, state, regime, mc_result)
+        signal_readings = [
+            SignalReading(
+                name="regime_rule_based", kind="regime",
+                detail=regime.regime.value, confidence=regime.confidence,
+            ),
+            *(
+                [SignalReading(
+                    name="regime_hmm", kind="regime",
+                    detail=challenger_regime.regime.value, confidence=challenger_regime.confidence,
+                )]
+                if self._challenger_regime_detector is not None else []
+            ),
+            *signal_readings,
+        ]
 
         if self._duration_selector is not None:
             mu, sigma = self._estimate_gbm_params(symbol)
@@ -447,6 +565,26 @@ class PaperTradingOrchestrator:
         result["decision"] = decision
 
         if decision.action == "buy":
+            result["signal_agreement"] = {
+                "symbol": symbol,
+                "direction": ev.direction,
+                "readings": [
+                    {
+                        "name": r.name,
+                        "kind": r.kind,
+                        "detail": r.detail,
+                        "confidence": r.confidence,
+                        # Only probability-model rows have a directional prediction to
+                        # compare against the trade — regime rows report "n/a" (None),
+                        # never a False, since "no direction to agree/disagree with" is
+                        # not the same claim as "this regime disagreed with the trade".
+                        "agrees": (
+                            (r.expected_direction == ev.direction) if r.kind == "probability" else None
+                        ),
+                    }
+                    for r in signal_readings
+                ],
+            }
             self._pending_trades[symbol] = opportunity_to_pending_trade(
                 opportunity,
                 entry_close=candle.close,
@@ -508,31 +646,54 @@ class PaperTradingOrchestrator:
             horizon_ticks=horizon_ticks or self._contract.duration_ticks,
         )
 
-    def _predict_probability(self, symbol: str, state: MarketState, regime, mc_result) -> ProbabilityEstimate:
+    def _predict_probability(
+        self, symbol: str, state: MarketState, regime, mc_result,
+    ) -> tuple[ProbabilityEstimate, list[SignalReading]]:
         """
-        Returns the `BayesianLogisticRegression`-only prediction when
-        `fusion_config` was never passed to `__init__` (the default,
-        fully backward-compatible path) — otherwise fuses whichever of
+        Returns `(estimate, readings)`. `estimate` is the
+        `BayesianLogisticRegression`-only prediction when `fusion_config`
+        was never passed to `__init__` (the default, fully
+        backward-compatible path) — otherwise fuses whichever of
         {Bayesian Logistic, Bagged GBM, Monte Carlo GBM} are configured,
         using this regime's weights from `WeightLearner`. See module
         docstring's "Optional Ensemble Fusion" section.
+
+        `readings` is every individual model's own (pre-fusion) prediction
+        as a `SignalReading` — kept separate from the fused result so a
+        caller can show which underlying signals actually agreed with the
+        direction the fused estimate (and any downstream trade) settled
+        on, rather than only ever seeing the single blended number.
         """
         bayesian_estimate = self._probability_models[symbol].predict(state)
+        readings = [self._reading_from_estimate("bayesian_logistic", bayesian_estimate)]
         if self._fusion_engine is None:
-            return bayesian_estimate
+            return bayesian_estimate, readings
 
         members: dict[str, ProbabilityEstimate] = {"bayesian_logistic": bayesian_estimate}
         if symbol in self._bagged_gbm_models:
-            members["bagged_gbm"] = self._bagged_gbm_models[symbol].predict(state)
+            gbm_estimate = self._bagged_gbm_models[symbol].predict(state)
+            members["bagged_gbm"] = gbm_estimate
+            readings.append(self._reading_from_estimate("bagged_gbm", gbm_estimate))
         if mc_result is not None and mc_result.is_valid:
-            members["monte_carlo_gbm"] = monte_carlo_result_to_probability_estimate(mc_result)
+            mc_estimate = monte_carlo_result_to_probability_estimate(mc_result)
+            members["monte_carlo_gbm"] = mc_estimate
+            readings.append(self._reading_from_estimate("monte_carlo_gbm", mc_estimate))
 
         weights = self._weight_learner.get_weights(regime.regime if regime.is_valid else None)
         symbol_sufficiency = self._sufficiency.get(symbol, {})
         if symbol_sufficiency:
             weights = apply_sufficiency_scaling(weights, symbol_sufficiency)
         fused = self._fusion_engine.fuse(symbol, state.epoch, members, weights, regime.regime if regime.is_valid else None)
-        return fused.to_probability_estimate() if fused.is_valid else bayesian_estimate
+        estimate = fused.to_probability_estimate() if fused.is_valid else bayesian_estimate
+        return estimate, readings
+
+    @staticmethod
+    def _reading_from_estimate(name: str, estimate: ProbabilityEstimate) -> SignalReading:
+        detail = {1: "up", -1: "down", 0: "no edge"}.get(estimate.expected_direction, "no edge")
+        return SignalReading(
+            name=name, kind="probability", detail=detail,
+            confidence=estimate.confidence, expected_direction=estimate.expected_direction,
+        )
 
     def _better_available_competitor(self, symbol: str, quality_score: float) -> str | None:
         """
@@ -680,6 +841,18 @@ class PaperTradingOrchestrator:
     @property
     def equity(self) -> float:
         return self._risk_engine.equity
+
+    @property
+    def starting_equity(self) -> float:
+        return self._paper_config.starting_equity
+
+    @property
+    def total_pnl(self) -> float:
+        """Cumulative PnL across every settled trade so far — equivalent to
+        `equity - starting_equity` (no fees/interest modeled anywhere in
+        this pipeline, so the two are always exactly equal); exposed
+        directly so callers don't need to know that equivalence holds."""
+        return self._risk_engine.equity - self._paper_config.starting_equity
 
     def current_rankings(self) -> dict[str, SymbolEvaluation]:
         """Every symbol's most recently computed opportunity evaluation —
