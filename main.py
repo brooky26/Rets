@@ -374,16 +374,33 @@ async def run(config_path: str) -> None:
         settled = result["settled"]
         if settled is not None:
             logger.info(
-                "SETTLED %s: %s pnl=%.2f (equity=%.2f, total_trades=%d)",
+                "SETTLED %s: %s pnl=%.2f | ACCOUNT trades_taken=%d total_pnl=%.2f balance=%.2f",
                 settled.symbol,
                 "WIN" if settled.was_win else "LOSS",
                 settled.pnl,
-                orchestrator.equity,
                 orchestrator.n_trades_recorded,
+                orchestrator.total_pnl,
+                orchestrator.equity,
             )
         decision = result["decision"]
         if decision is not None and decision.action != "skip":
             logger.info("DECISION %s: %s (%s)", decision.symbol, decision.action, decision.reason)
+
+        signal_agreement = result["signal_agreement"]
+        if signal_agreement is not None:
+            direction_label = {1: "CALL (up)", -1: "PUT (down)", 0: "no edge"}.get(
+                signal_agreement["direction"], "no edge"
+            )
+            header = f"{'Signal':<20} | {'Says':<10} | {'Agrees':<6} | Confidence"
+            sep = "-" * len(header)
+            rows = []
+            for r in signal_agreement["readings"]:
+                agrees = {True: "YES", False: "NO", None: "n/a"}[r["agrees"]]
+                rows.append(f"{r['name']:<20} | {r['detail']:<10} | {agrees:<6} | {r['confidence']:.2f}")
+            logger.info(
+                "SIGNAL AGREEMENT %s (trade direction=%s):\n%s\n%s\n%s",
+                signal_agreement["symbol"], direction_label, header, sep, "\n".join(rows),
+            )
 
         rankings = result["rankings"]
         if rankings is not None:
@@ -426,12 +443,29 @@ async def run(config_path: str) -> None:
         if completed_candle is not None:
             await on_candle(completed_candle)
 
+    async def on_late_contract(context: str, buy_result: dict) -> None:
+        # `orchestrator` is read here at call time, not at closure-creation time —
+        # same forward-reference pattern `on_candle` above already relies on
+        # (`orchestrator` is declared None further up and only assigned below,
+        # after `client` is constructed, since orchestrator needs `client` as its
+        # broker_client). A late-contract event can only fire once live streaming
+        # has actually started, by which point orchestrator is always assigned.
+        if orchestrator is None:
+            logger.warning(
+                "Late contract recovered (context=%s, contract_id=%s) but paper_trading is "
+                "disabled — nothing to register it with. Reconcile against the account manually.",
+                context, buy_result.get("contract_id"),
+            )
+            return
+        await orchestrator.register_late_contract(context, buy_result)
+
     client = DerivWebSocketClient(
         connection_config=md_cfg.connection,
         historical_config=md_cfg.historical,
         integrity_validator=validator,
         on_tick=on_tick,
         on_connection_event=on_connection_event,
+        on_late_contract=on_late_contract,
     )
 
     if paper_cfg.enabled:
