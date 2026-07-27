@@ -38,6 +38,7 @@ class RiskAssessment:
     daily_loss_pct: float
     consecutive_losses: int
     expected_shortfall_pct: float      # NaN if insufficient trade history
+    martingale_step: int = 0          # 0 = base stake; >0 only when RiskConfig.martingale.enabled
     veto_reasons: list[str] = field(default_factory=list)
 
     @property

@@ -24,11 +24,23 @@ one simultaneously, not just the first failure):
     5. Risk of ruin, at the position size Kelly/exposure sizing arrives at.
     6. Expected shortfall (once enough trade history exists to estimate it).
 
-Position sizing: fractional-Kelly (kelly_fraction_multiplier * f*),
-additionally hard-capped by max_exposure_pct of current equity and
-floored at min_stake. If the floor exceeds the cap (tiny account, or an
-edge too thin to justify even the minimum stake), the trade is rejected
-outright rather than silently forcing a stake outside the intended range.
+Position sizing: fractional-Kelly (kelly_fraction_multiplier * f*) by
+default, additionally hard-capped by max_exposure_pct of current equity
+and floored at min_stake. If the floor exceeds the cap (tiny account, or
+an edge too thin to justify even the minimum stake), the trade is
+rejected outright rather than silently forcing a stake outside the
+intended range.
+
+Alternative sizing: if `RiskConfig.martingale.enabled` is True, stakes
+are sized by a bounded loss-streak schedule instead of Kelly — see
+`MartingaleConfig`'s docstring (configs/risk_schema.py) for the full
+mechanics (base stake, escalation factor, trigger, step cap, reset).
+Kelly's numbers are still computed and reported in every RiskAssessment
+either way, for comparison, even when they aren't what actually sized
+the trade. Every circuit breaker above still applies unconditionally
+regardless of which sizing scheme is active — martingale being enabled
+changes what stake gets PROPOSED, never whether the daily-loss,
+drawdown, consecutive-loss, or risk-of-ruin checks can veto it.
 """
 
 from __future__ import annotations
@@ -50,11 +62,13 @@ class RiskEngine:
         if starting_equity <= 0:
             raise ValueError("starting_equity must be positive")
         self._config = config
+        self._starting_equity = starting_equity  # never mutated — the reference point for martingale's equity-growth scaling, distinct from _peak_equity which does move
         self._equity = starting_equity
         self._peak_equity = starting_equity
         self._current_day: int | None = None
         self._day_start_equity = starting_equity
         self._consecutive_losses = 0
+        self._martingale_step = 0  # 0 = base stake; only advances when config.martingale.enabled
         self._trade_pnls: list[float] = []
         self._trade_pnl_pcts: list[float] = []  # pnl as fraction of equity at the time
         self._consecutive_loss_cooldown_remaining = 0
@@ -84,10 +98,20 @@ class RiskEngine:
         if outcome.pnl > 0:
             self._consecutive_losses = 0
             self._consecutive_loss_cooldown_remaining = 0  # a win also clears any active cooldown
+            self._martingale_step = 0  # a win resets the escalation too — the ordinary martingale-recovers-then-resets behavior
         else:
             self._consecutive_losses += 1
             if self._consecutive_losses >= self._config.max_consecutive_losses:
                 self._consecutive_loss_cooldown_remaining = self._config.consecutive_loss_cooldown_evaluations
+            if self._consecutive_losses >= self._config.martingale.loss_streak_trigger:
+                if self._martingale_step >= self._config.martingale.max_steps:
+                    # Hit the cap on this loss — force-reset rather than climbing further.
+                    # This is what makes the scheme bounded, not the escalate-forever kind.
+                    self._martingale_step = 0
+                else:
+                    self._martingale_step += 1
+            # else: still below the trigger (e.g. only 1 consecutive loss with the default
+            # trigger of 2) — step stays at 0, base stake continues.
 
         self._trade_pnls.append(outcome.pnl)
         self._trade_pnl_pcts.append(pnl_pct)
@@ -188,7 +212,9 @@ class RiskEngine:
 
         # Position sizing (computed regardless of vetoes above, so the
         # assessment is informative even when rejected — e.g. "here's
-        # what we WOULD have staked").
+        # what we WOULD have staked"). Kelly's f_raw/f_applied are always
+        # computed and reported, even when martingale.enabled — useful for
+        # comparison — but only drive candidate_stake when martingale is off.
         p = ev_estimate.probability_used if ev_estimate.is_valid else NAN
         b = ev_estimate.reward_to_risk if ev_estimate.is_valid else NAN
 
@@ -196,8 +222,20 @@ class RiskEngine:
         f_applied = f_raw * self._config.kelly_fraction_multiplier
 
         exposure_cap_stake = self._equity * self._config.max_exposure_pct
-        kelly_stake = f_applied * self._equity
-        candidate_stake = min(kelly_stake, exposure_cap_stake)
+
+        if self._config.martingale.enabled:
+            equity_growth_ratio = (
+                (self._equity - self._starting_equity) / self._starting_equity
+                if self._starting_equity > 0 else 0.0
+            )
+            base_stake = self._config.min_stake * (
+                1.0 + self._config.martingale.equity_growth_factor * max(0.0, equity_growth_ratio)
+            )
+            martingale_stake = base_stake * (self._config.martingale.factor ** self._martingale_step)
+            candidate_stake = min(martingale_stake, exposure_cap_stake)
+        else:
+            kelly_stake = f_applied * self._equity
+            candidate_stake = min(kelly_stake, exposure_cap_stake)
 
         if candidate_stake < self._config.min_stake:
             veto_reasons.append(
@@ -235,5 +273,6 @@ class RiskEngine:
             daily_loss_pct=self.daily_loss_pct,
             consecutive_losses=self._consecutive_losses,
             expected_shortfall_pct=es_pct,
+            martingale_step=self._martingale_step,
             veto_reasons=veto_reasons,
         )
