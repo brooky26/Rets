@@ -5,6 +5,79 @@ from __future__ import annotations
 from pydantic import BaseModel, Field, field_validator
 
 
+class MartingaleConfig(BaseModel):
+    """
+    Opt-in loss-streak-based stake escalation, run as an alternative to
+    (not alongside) fractional-Kelly sizing when `enabled` — see
+    RiskEngine.assess()'s branch on this flag. Disabled by default at the
+    schema level, consistent with every other "more aggressive than the
+    conservative default" toggle in this codebase; this specific
+    deployment turns it on in configs/default.yaml as an explicit,
+    informed choice.
+
+    Every escalation is still hard-capped by RiskConfig.max_exposure_pct
+    of current equity (same backstop Kelly sizing already has) and by
+    max_steps below — this is a genuinely BOUNDED martingale, not the
+    unbounded kind that has documented account-destroying history (see
+    this platform's own commit history / conversation log referencing a
+    real $12,000 -> $7.54 account wipeout in a different bot's martingale
+    implementation, which had no step cap at all).
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="If True, RiskEngine.assess() sizes stakes via this loss-streak schedule "
+        "instead of fractional-Kelly. Kelly's f_raw/f_applied are still computed and reported "
+        "in RiskAssessment either way, for comparison — just not used to size the trade.",
+    )
+    loss_streak_trigger: int = Field(
+        default=2,
+        description="Escalation only starts once this many CONSECUTIVE losses have occurred — "
+        "e.g. with the default of 2, a single loss still stakes at the base amount; the very "
+        "next trade after a SECOND consecutive loss is the first escalated one.",
+    )
+    factor: float = Field(
+        default=1.39,
+        description="Multiplicative escalation per step once triggered: base_stake * factor^step.",
+    )
+    max_steps: int = Field(
+        default=4,
+        description="Hard cap on escalation steps. On the loss that WOULD push past this cap, "
+        "the step count force-resets to 0 (base stake) instead of continuing to climb — this is "
+        "what makes the scheme bounded rather than open-ended. A win resets the step to 0 too, "
+        "the ordinary martingale-recovers-then-resets behavior.",
+    )
+    equity_growth_factor: float = Field(
+        default=0.10,
+        description="Deliberately small, per an explicit 'grows with the account but not so "
+        "much' request: base_stake = min_stake * (1 + this * max(0, equity_growth_ratio)), where "
+        "equity_growth_ratio = (current_equity - starting_equity) / starting_equity. With the "
+        "default of 0.10, an account that DOUBLES only grows its base stake by 10%, not 100% — "
+        "sub-linear on purpose, not a scaling bug.",
+    )
+
+    @field_validator("loss_streak_trigger", "max_steps")
+    @classmethod
+    def _positive_int(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("must be a positive integer")
+        return v
+
+    @field_validator("factor")
+    @classmethod
+    def _factor_above_one(cls, v: float) -> float:
+        if v <= 1.0:
+            raise ValueError("factor must be > 1.0 — a value <= 1.0 wouldn't escalate at all")
+        return v
+
+    @field_validator("equity_growth_factor")
+    @classmethod
+    def _growth_factor_nonnegative(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("equity_growth_factor must be >= 0")
+        return v
+
+
 class RiskConfig(BaseModel):
     # --- Circuit breakers / capital preservation ---
     max_daily_loss_pct: float = Field(
@@ -41,7 +114,16 @@ class RiskConfig(BaseModel):
         default=0.02, description="Hard cap on any single trade's stake as a fraction of current equity, "
         "independent of what Kelly sizing suggests."
     )
-    min_stake: float = Field(default=1.0, description="Floor on recommended stake (e.g. Deriv's minimum stake).")
+    min_stake: float = Field(
+        default=1.0,
+        description="Floor on recommended stake (e.g. Deriv's minimum stake). When "
+        "martingale.enabled is True, this doubles as the martingale scheme's base/reset stake "
+        "— set it to your broker's real minimum for that symbol, since that's also the stake "
+        "used after every reset.",
+    )
+
+    # --- Position sizing: loss-streak-based alternative to Kelly ---
+    martingale: MartingaleConfig = Field(default_factory=MartingaleConfig)
 
     # --- Risk of ruin ---
     risk_of_ruin_threshold: float = Field(

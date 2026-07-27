@@ -58,6 +58,15 @@ regime_detection:
   enable_regime_consensus_gate: true # true = disagreement between rule-based and HMM blocks trading that candle; false = both logged, disagreement doesn't block
   hmm_promotion_train_fraction: 0.6
 
+risk:
+  min_stake: 0.35  # doubles as the martingale base/reset stake below
+  martingale:
+    enabled: true
+    loss_streak_trigger: 2   # a single loss alone doesn't escalate — only from the 2nd consecutive loss onward
+    factor: 1.39
+    max_steps: 4             # bounded: the loss that would push past this force-resets to base instead of climbing further
+    equity_growth_factor: 0.10  # base stake grows by only 10% of the account's proportional growth — deliberately modest
+
 duration_selection:
   candidate_durations_ticks: [3, 5, 7, 8, 10]  # kept within Deriv's confirmed live limit of 1-10 ticks (see 'TicksNumberLimits' error, code_args: [1, 10]) — was [3, 5, 8, 12, 20], and 12/20 were rejected
   mc_max_standard_error: 0.05
@@ -81,4 +90,4 @@ continuous_learning:
 # ---------------------------------------------------------------------- #
 # environment: live               # (top of this file — currently "development")
 execution:
-  mode: "paper"                      # "paper" | "live" — flipped for live execution against the DEMO account (DERIV_ACCOUNT_TYPE=demo in Railway keeps this virtual money)
+  mode: "paper"                    # "paper" | "live" — see the block comment above before ever changing this
