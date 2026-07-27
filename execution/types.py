@@ -29,6 +29,10 @@ class BrokerClient(Protocol):
 
     async def buy(self, proposal_id: str, price: float) -> dict: ...
 
+    async def buy_direct(
+        self, symbol: str, contract_type_code: str, stake: float, duration_ticks: int, currency: str
+    ) -> dict: ...
+
     async def check_contract_status(self, contract_id: str) -> dict: ...
 
 
