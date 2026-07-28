@@ -193,7 +193,7 @@ class PaperTradingOrchestrator:
         weight_learner: WeightLearner | None = None,
         duration_selection_config: DurationSelectionConfig | None = None,
         challenger_regime_detector: GaussianHMMRegimeDetector | None = None,
-        enable_regime_consensus_gate: bool = False,
+        sequence_model_estimators: dict[str, object] | None = None,
     ) -> None:
         self._paper_config = paper_config
         self._probability_config = probability_config
@@ -201,7 +201,7 @@ class PaperTradingOrchestrator:
         self._monte_carlo_config = monte_carlo_config
         self._regime_detector = regime_detector
         self._challenger_regime_detector = challenger_regime_detector
-        self._enable_regime_consensus_gate = enable_regime_consensus_gate
+        self._sequence_model_estimators = sequence_model_estimators or {}
         self._state_encoder = state_encoder
 
         self._ev_engine = ExpectedValueEngine(ev_config)
@@ -465,26 +465,37 @@ class PaperTradingOrchestrator:
         if not state.is_valid:
             return result
 
-        regime = self._regime_detector.classify(state)
+        regime_rule_based = self._regime_detector.classify(state)
 
+        # Rule-based is informational-only (see module docstring's "Regime
+        # consensus" section for the full history: it used to hold equal veto
+        # power alongside the HMM in a hard consensus gate, retired after real
+        # disagreement-rate evidence — ~158 disagreements in 1.5 hours of live
+        # trading — suggested rule-based's memoryless, fixed-threshold reads
+        # were adding noise rather than a genuine second opinion against a
+        # detector with real temporal memory and a wider feature set). HMM
+        # becomes the OPERATIVE regime (fed into probability estimation,
+        # duration selection, and scoring) once a challenger is registered;
+        # rule-based's own classification is still computed and reported in
+        # every result["regime_consensus"], just never blocks or drives
+        # anything by itself anymore. Falls back to rule-based as the
+        # operative regime only when no HMM challenger is registered yet
+        # (e.g. before the continuous-learning cron's first successful run) —
+        # same safe-fallback spirit as everywhere else in this file.
         if self._challenger_regime_detector is not None:
-            challenger_regime = self._challenger_regime_detector.classify(state)
-            agree = challenger_regime.regime == regime.regime
+            regime_hmm = self._challenger_regime_detector.classify(state)
+            regime = regime_hmm
             result["regime_consensus"] = {
-                "rule_based": regime.regime, "hmm": challenger_regime.regime, "agree": agree,
+                "rule_based": regime_rule_based.regime, "hmm": regime_hmm.regime,
+                "agree": regime_hmm.regime == regime_rule_based.regime,
+                "operative_source": "hmm",
             }
-            if self._enable_regime_consensus_gate and not agree:
-                # Disagreement gate: same "nothing to do this cycle" treatment as
-                # an invalid state or a no-edge probability estimate — this is a
-                # deliberate abstention, not an error, so it's logged plainly and
-                # the cycle ends here, before any of the more expensive scoring
-                # work below. See the module-level docstring's "Regime
-                # consensus" section for the full rationale.
-                self._latest_evaluations[symbol] = SymbolEvaluation(
-                    quality_score=0.0, epoch=candle.epoch, approved=False,
-                )
-                result["rankings"] = dict(self._latest_evaluations)
-                return result
+        else:
+            regime = regime_rule_based
+            result["regime_consensus"] = {
+                "rule_based": regime_rule_based.regime, "hmm": None, "agree": None,
+                "operative_source": "rule_based",
+            }
 
         # Reference-horizon MC evidence (self._contract.duration_ticks) for fusion
         # input, since fusion must run BEFORE any duration is chosen — direction
@@ -495,12 +506,12 @@ class PaperTradingOrchestrator:
         signal_readings = [
             SignalReading(
                 name="regime_rule_based", kind="regime",
-                detail=regime.regime.value, confidence=regime.confidence,
+                detail=regime_rule_based.regime.value, confidence=regime_rule_based.confidence,
             ),
             *(
                 [SignalReading(
                     name="regime_hmm", kind="regime",
-                    detail=challenger_regime.regime.value, confidence=challenger_regime.confidence,
+                    detail=regime_hmm.regime.value, confidence=regime_hmm.confidence,
                 )]
                 if self._challenger_regime_detector is not None else []
             ),
@@ -678,6 +689,20 @@ class PaperTradingOrchestrator:
             mc_estimate = monte_carlo_result_to_probability_estimate(mc_result)
             members["monte_carlo_gbm"] = mc_estimate
             readings.append(self._reading_from_estimate("monte_carlo_gbm", mc_estimate))
+        # LSTM/Transformer sequence models — only present once the continuous-learning
+        # cron has actually trained and persisted a champion for that model_type (see
+        # main.py's load_sequence_model_challengers_if_available); absent otherwise,
+        # same safe "just fuse what's available" fallback as bagged_gbm/monte_carlo_gbm
+        # above. WeightLearner already carries weight slots for these two names (they've
+        # been in meta_learning.model_names since before this wiring existed) — this is
+        # what actually activates them, not a config change.
+        for seq_name, seq_model in (self._sequence_model_estimators or {}).items():
+            if not getattr(seq_model, "is_fitted", False):
+                continue
+            seq_estimate = seq_model.predict(state)
+            if seq_estimate.is_valid:
+                members[seq_name] = seq_estimate
+                readings.append(self._reading_from_estimate(seq_name, seq_estimate))
 
         weights = self._weight_learner.get_weights(regime.regime if regime.is_valid else None)
         symbol_sufficiency = self._sufficiency.get(symbol, {})
@@ -818,15 +843,16 @@ class PaperTradingOrchestrator:
 
     def set_challenger_regime_detector(self, detector: GaussianHMMRegimeDetector | None) -> None:
         """
-        Registers (or clears, if `detector` is None) the HMM as a
-        standing second opinion that runs alongside the primary
-        (rule-based) detector every candle — this is the regime-consensus
-        approach: no swap, no single winner, both detectors are always
-        consulted once this is set. See `on_candle`'s regime-consensus
-        block for how agreement/disagreement is handled, and
-        `RegimeDetectionConfig.enable_regime_consensus_gate` for whether
-        disagreement actually blocks trading or is just logged for
-        observability.
+        Registers (or clears, if `detector` is None) the HMM as the
+        OPERATIVE regime source — the one actually fed into probability
+        estimation, duration selection, and scoring — while rule-based's
+        own classification is still computed and reported in every
+        result["regime_consensus"], purely for observability. Rule-based
+        is only ever the operative regime when no HMM challenger is
+        registered (e.g. before the continuous-learning cron's first
+        successful run) — see `on_candle`'s regime-consensus block for
+        the full reasoning behind demoting rule-based from its former
+        equal-veto role.
 
         Safe to call at any point, same as `update_regime_detector` — read
         fresh via `.classify(state)` every `on_candle` call, never cached
@@ -834,8 +860,9 @@ class PaperTradingOrchestrator:
         """
         self._challenger_regime_detector = detector
         logger.info(
-            "Regime consensus challenger %s.",
-            "cleared" if detector is None else f"set: {type(detector).__name__}",
+            "HMM regime detector (operative once set) %s.",
+            "cleared — rule-based is now the operative fallback" if detector is None
+            else f"set: {type(detector).__name__}",
         )
 
     @property
