@@ -31,16 +31,17 @@ STARTUP SEQUENCE, before live streaming begins:
      bug to "fix" by lowering the bar silently.
   3. If regime_detection.enable_hmm_promotion is True: the SAME
      bootstrap (states, closes) are reused (no second fetch) to fit a
-     Gaussian HMM per symbol, registered as a standing regime-consensus
-     CHALLENGER via PaperTradingOrchestrator.set_challenger_regime_detector
-     — NOT a promote-and-swap decision anymore. From here on, every
-     candle classifies regime with BOTH rule-based (primary, always
-     active) and the HMM; if they disagree and
-     regime_detection.enable_regime_consensus_gate is True, that candle
-     is treated as nothing-to-trade (logged, not an error). Fitting
-     failure (e.g. insufficient bootstrap history for a symbol) leaves
-     no challenger registered for that symbol — rule-based operates
-     alone, the same safe fallback as before. The classic one-shot
+     Gaussian HMM per symbol, registered as the OPERATIVE regime source
+     via PaperTradingOrchestrator.set_challenger_regime_detector — fed
+     into probability estimation, duration selection, and scoring from
+     then on. Rule-based's own classification is still computed and
+     reported in every result["regime_consensus"], just no longer drives
+     or blocks anything (demoted from an earlier equal-veto
+     consensus-gate design — see PaperTradingOrchestrator.on_candle's
+     regime-consensus block for the full reasoning). Fitting failure
+     (e.g. insufficient bootstrap history for a symbol) leaves no
+     challenger registered — rule-based operates as the operative
+     fallback, the same safe behavior as before. The classic one-shot
      statistical promotion/swap flow this replaced still exists in
      regime/promotion.py for anyone who wants it directly; it's just not
      what this flag wires up by default anymore. Continuous learning of
@@ -107,7 +108,7 @@ from expected_value.types import ContractSpec, ContractType
 from features.pipeline import FeatureEngineeringPipeline
 from features.types import FeatureVector
 from model_registry.registry import ModelRegistry
-from model_registry.store import InMemoryModelRegistryStore
+from model_registry.store import InMemoryModelRegistryStore, JSONFileModelRegistryStore
 from paper_trading.orchestrator import PaperTradingOrchestrator
 from regime.hmm_detector import GaussianHMMRegimeDetector
 from regime.rule_based import RuleBasedRegimeDetector
@@ -282,11 +283,74 @@ def fit_hmm_challenger_if_enabled(
 
         orchestrator.set_challenger_regime_detector(hmm_detector)
         logger.info(
-            "%s: HMM challenger fitted on %d states and registered for regime consensus "
-            "(gate %s).", symbol, len(valid_states),
-            "enabled" if regime_cfg.enable_regime_consensus_gate else "disabled (observation-only)",
+            "%s: HMM challenger fitted on %d states and registered — now the operative regime "
+            "source for probability estimation/scoring (rule-based remains informational-only).",
+            symbol, len(valid_states),
         )
         break  # only the first successful fit actually gets applied, given the shared-detector scope note above
+
+
+def load_sequence_model_challengers_if_available() -> dict[str, object]:
+    """
+    Loads a champion LSTM and/or Transformer sequence model, if the
+    continuous-learning cron (Option C — continuous_learning/orchestrator
+    .py's daily _run_once_async) has actually trained and persisted one,
+    for use as live fusion members (see PaperTradingOrchestrator
+    ._predict_probability — this is what activates them there; they were
+    previously trained daily but never consulted for a live decision).
+
+    Same env vars the cron writes to (CL_DATA_DIR / CL_REGISTRY_PATH /
+    CL_ARTIFACT_PATH), read-only here — this process never trains these
+    models itself, only ever loads what the cron already produced.
+
+    Returns {} (not an error) if the cron hasn't run yet, hasn't produced
+    a champion for either model_type, or CL_DATA_DIR isn't configured at
+    all on this service — the exact same safe "just fuse what's
+    available" fallback used throughout this file for optional signals.
+    """
+    import pickle
+    from pathlib import Path
+
+    data_dir = os.environ.get("CL_DATA_DIR", "./data_store")
+    registry_path = os.environ.get("CL_REGISTRY_PATH", str(Path(data_dir) / "model_registry.json"))
+    artifact_path = os.environ.get("CL_ARTIFACT_PATH", str(Path(data_dir) / "model_artifacts.pkl"))
+
+    if not Path(registry_path).exists() or not Path(artifact_path).exists():
+        logger.info(
+            "No continuous-learning registry/artifacts found yet at %s / %s — live fusion will "
+            "run without LSTM/Transformer sequence models until the cron's first successful run.",
+            registry_path, artifact_path,
+        )
+        return {}
+
+    try:
+        registry = ModelRegistry(JSONFileModelRegistryStore(registry_path))
+        with open(artifact_path, "rb") as f:
+            artifacts = pickle.load(f)
+    except Exception as exc:  # noqa: BLE001 — a corrupt/unreadable file must not crash the worker
+        logger.warning(
+            "Failed to load continuous-learning registry/artifacts (%s) — live fusion will run "
+            "without LSTM/Transformer sequence models this session.", exc,
+        )
+        return {}
+
+    estimators: dict[str, object] = {}
+    for model_type in ("lstm_sequence", "transformer_sequence"):
+        champion = registry.get_champion(model_type)
+        if champion is None:
+            logger.info("%s: no champion yet — skipping for live fusion.", model_type)
+            continue
+        model = artifacts.get(champion.model_id)
+        if model is None:
+            logger.warning(
+                "%s: registry has a champion (%s) but no matching artifact was found in %s — "
+                "skipping for live fusion.", model_type, champion.model_id, artifact_path,
+            )
+            continue
+        estimators[model_type] = model
+        logger.info("%s: loaded champion %s for live fusion.", model_type, champion.model_id)
+
+    return estimators
 
 
 async def run(config_path: str) -> None:
@@ -494,7 +558,7 @@ async def run(config_path: str) -> None:
                 if (paper_cfg.use_ensemble_fusion or paper_cfg.use_duration_selection) else None
             ),
             duration_selection_config=config.duration_selection if paper_cfg.use_duration_selection else None,
-            enable_regime_consensus_gate=config.regime_detection.enable_regime_consensus_gate,
+            sequence_model_estimators=load_sequence_model_challengers_if_available(),
         )
 
     try:
