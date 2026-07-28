@@ -92,8 +92,9 @@ class DerivConnectionConfig(BaseModel):
         ),
     )
     symbols: list[str] = Field(
-        default=["stpRNG", "stpRNG2", "stpRNG3", "stpRNG4", "stpRNG5"],
-        description="Deriv symbol codes for Step Index 100/200/300/400/500.",
+        default=["R_75", "R_100"],
+        description="Deriv symbol codes — Volatility 75 and Volatility 100 Index (was the Step "
+        "Index family: stpRNG through stpRNG5).",
     )
     ping_interval_seconds: float = 20.0
     ping_timeout_seconds: float = Field(

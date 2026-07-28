@@ -126,24 +126,24 @@ class RegimeDetectionConfig(BaseModel):
         default=False,
         description="If True, main.py fits a GaussianHMMRegimeDetector at startup on the same "
         "historical states/closes gathered for probability-model bootstrap, and registers it as "
-        "a standing regime-consensus challenger (see PaperTradingOrchestrator"
-        ".set_challenger_regime_detector) — both rule-based and HMM run every candle from then "
-        "on, rather than one replacing the other. (Prior to the regime-consensus design, this "
-        "flag instead triggered a one-shot Champion-Challenger promotion that could swap the HMM "
-        "in as the sole detector; that flow still exists in regime/promotion.py for anyone who "
-        "wants it, but is no longer what this flag wires up by default.) Fitting failure (e.g. "
-        "insufficient bootstrap history) leaves no challenger registered — rule-based operates "
-        "alone, the same safe fallback as before.",
+        "the OPERATIVE regime source via PaperTradingOrchestrator.set_challenger_regime_detector "
+        "— fed into probability estimation, duration selection, and scoring from then on. "
+        "Rule-based's own classification is still computed and reported in every "
+        "result['regime_consensus'] for observability, but no longer drives or blocks anything "
+        "(demoted from an earlier equal-veto consensus-gate design after real disagreement-rate "
+        "evidence suggested its memoryless, fixed-threshold reads were adding noise rather than a "
+        "genuine second opinion against a detector with real temporal memory and a wider feature "
+        "set — see PaperTradingOrchestrator.on_candle's regime-consensus block). Fitting failure "
+        "(e.g. insufficient bootstrap history) leaves no challenger registered — rule-based "
+        "operates as the operative fallback, the same safe behavior as before this flag existed.",
     )
     enable_regime_consensus_gate: bool = Field(
         default=False,
-        description="Only meaningful once enable_hmm_promotion has actually registered a "
-        "challenger. If True, a candle where rule-based and the HMM challenger disagree on the "
-        "regime label is treated as 'nothing to trade this cycle' (logged, not an error) — "
-        "PaperTradingOrchestrator.on_candle bails out before scoring/execution. If False, both "
-        "classifications are still computed and logged (result['regime_consensus']) for "
-        "observability, but disagreement does not block trading — useful for watching how often "
-        "the two would actually disagree before committing to the more conservative gated mode.",
+        description="RETIRED — no longer read by any code. Previously gated trading on rule-based "
+        "vs HMM disagreement; rule-based has since been demoted to informational-only (see "
+        "enable_hmm_promotion's docstring), so there's no longer a disagreement to gate on. Kept "
+        "in the schema only so old YAML configs that still set this don't fail to load; safe to "
+        "delete from your config whenever convenient.",
     )
     hmm_promotion_train_fraction: float = Field(
         default=0.6,

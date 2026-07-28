@@ -1,4 +1,4 @@
-environment: live
+environment: development
 
 market_data:
   connection:
@@ -9,11 +9,8 @@ market_data:
     api_token: null                # set for authenticated access; null = public market data only
     account_id: null               # e.g. "DOT90004580" — required if api_token is set
     symbols:
-      - "stpRNG"
-      - "stpRNG2"
-      - "stpRNG3"
-      - "stpRNG4"
-      - "stpRNG5"
+      - "R_75"
+      - "R_100"
     ping_interval_seconds: 20.0
     ping_timeout_seconds: 40.0  # was implicitly 20.0 (websockets library default) — raised after real 'keepalive ping timeout' disconnects coinciding with measured 25-50s slow stretches
     reconnect_initial_backoff_seconds: 1.0
@@ -56,7 +53,8 @@ paper_trading:
 
 regime_detection:
   enable_hmm_promotion: true         # true = fit HMM at startup and register it as a standing regime-consensus challenger (see configs/regime_schema.py)
-  enable_regime_consensus_gate: true # true = disagreement between rule-based and HMM blocks trading that candle; false = both logged, disagreement doesn't block
+  # enable_regime_consensus_gate retired — rule-based is now informational-only (see
+  # configs/regime_schema.py), HMM is the operative regime once enable_hmm_promotion fits one.
   hmm_promotion_train_fraction: 0.6
 
 risk:
@@ -91,4 +89,4 @@ continuous_learning:
 # ---------------------------------------------------------------------- #
 # environment: live               # (top of this file — currently "development")
 execution:
-  mode: "live"                    # "paper" | "live" — see the block comment above before ever changing this
+  mode: "paper"                    # "paper" | "live" — see the block comment above before ever changing this
